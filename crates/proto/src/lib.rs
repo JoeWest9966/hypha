@@ -336,6 +336,14 @@ pub fn b64d(s: &str) -> anyhow::Result<Vec<u8>> {
     Ok(base64::engine::general_purpose::STANDARD.decode(s)?)
 }
 
+/// Version of the HTTP contract in `api/openapi.yaml`.
+///
+/// Bump on any breaking change (field removed/renamed, status code semantics,
+/// stream framing). Additive fields do not bump it: consumers ignore unknown
+/// fields, and a panel that refuses to run against a version it does not know
+/// is strictly better than one that half-works.
+pub const API_VERSION: u32 = 1;
+
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }

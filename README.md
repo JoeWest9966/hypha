@@ -136,11 +136,52 @@ The agent never listens on a port and never talks to anything except the hub.
 - **Keep an out-of-band way in** (ssh, cloud console). A tool that becomes your
   only door and then breaks is worse than ssh.
 
+## Panel and API are separate projects
+
+The panel is being extracted into its own repository (**mycelium**), because it
+needs a real build step (React + TypeScript) and it ships on its own schedule.
+The hub is API-only from here on, and `api/openapi.yaml` is the contract between
+them.
+
+Three things make that split safe rather than merely tidy:
+
+**1. `api/openapi.yaml` is the single source of truth.** Every panel-facing
+route, request body, response shape and stream framing lives there. It is
+OpenAPI 3.1, so the TypeScript client is generated, not hand-written.
+
+**2. There is a version gate.** `GET /api/meta` returns `api_version`. A panel
+refuses to render against a version it does not know, instead of half-working
+against a contract it was not built for. Breaking changes bump it; added fields
+do not.
+
+**3. The router and the spec cannot drift.** `scripts/check-api-contract.sh`
+fails when a route is served but undocumented, or documented but not served.
+
+```
+browser ──► nginx :5522 ──┬─► /var/www/mycelium   React build, static
+                          └─► 127.0.0.1:5599      hyphad: /api, /agent, /install.sh, /dl
+```
+
+`hyphad` runs API-only when no panel bundle is present — that is a supported
+deployment shape, not a broken install:
+
+```json
+{ "listen": "127.0.0.1:5599", "public_url": "https://hub.example.com" }
+```
+
+It still serves the installer endpoints (`/install.sh`, `/dl/{name}`) because
+those are how a satellite gets onto a machine, not part of the panel. See
+`dist/nginx-hypha.conf` for the routing, SSE/WebSocket streaming settings and the
+`Cache-Control` split (`index.html` no-store, hashed assets immutable). If you
+fork `mycelium` and want the single-binary story back, point `static_dir` at its
+`dist/` — the hub will serve it from anywhere.
+
 ## Tests
 
 ```sh
+scripts/check-api-contract.sh # router ↔ api/openapi.yaml, fails on drift
 scripts/smoke.sh              # hub + local satellite: enroll, exec, exit codes, pty, audit
-cd panel-test && npm i && npm test   # panel driven in jsdom against the real api contract
+cd panel-test && npm i && npm test   # legacy panel driven in jsdom (deleted once mycelium lands)
 ```
 
 ## Status
@@ -160,7 +201,8 @@ crates/cli     hypha   — the cli
 dist/          install.sh, units, proxy config
 scripts/       build.sh (static musl), smoke.sh
 panel-test/    headless panel test (jsdom)
-crates/hub/static  the panel (vanilla js + xterm.js, no build step)
+api/           openapi.yaml — the contract the panel is built against
+crates/hub/static  legacy panel (vanilla js); mycelium replaces it
 ```
 
 ## License

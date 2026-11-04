@@ -57,6 +57,10 @@ pub async fn meta(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({
         "name": "hypha",
         "version": env!("CARGO_PKG_VERSION"),
+        // The panel is a separate project that ships on its own schedule. This
+        // is the only thing stopping it from rendering a contract it does not
+        // understand.
+        "api_version": API_VERSION,
         "hosts_total": hosts.len(),
         "hosts_online": online,
     }))
@@ -432,4 +436,25 @@ pub async fn download(
 
 pub async fn health() -> impl IntoResponse {
     Json(json!({ "ok": true }))
+}
+
+/// Fallback when no panel bundle is configured.
+///
+/// The hub and the panel deploy separately now, so "no static dir" is a normal
+/// production shape, not a broken install. Say so instead of returning a bare
+/// 404 that looks like a routing bug.
+pub async fn no_panel() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "name": "hypha",
+            "api_version": API_VERSION,
+            "panel": null,
+            "hint": concat!(
+                "this hub serves the API only; serve the panel from nginx ",
+                "(root -> mycelium/dist), or point static_dir at a built panel"
+            ),
+            "docs": "/api/meta",
+        })),
+    )
 }

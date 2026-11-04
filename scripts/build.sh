@@ -5,6 +5,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 
+# The panel is a separate repository and is generated from api/openapi.yaml.
+# A release that ships a router the spec does not describe is not a release.
+./scripts/check-api-contract.sh
+
 stage() {
     target="$1"; plat="$2"; arch="$3"
     echo "==> $target"

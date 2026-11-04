@@ -36,21 +36,38 @@ struct Args {
     public_url: Option<String>,
 }
 
-fn find_static_dir(configured: &str) -> PathBuf {
-    let candidates = [
-        configured.to_string(),
-        "./static".into(),
-        "./crates/hub/static".into(),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/static").to_string(),
-        "/usr/local/share/hypha/static".into(),
+/// Locate a built panel bundle. Returns `None` when there is nothing to serve,
+/// which is a legal production state: the hub then runs API-only and nginx (or
+/// Caddy) serves the panel from wherever it was deployed.
+fn find_static_dir(configured: &str) -> Option<PathBuf> {
+    let configured = configured.trim();
+
+    // An explicit setting is the whole answer, including when it points nowhere.
+    // Falling back from a configured path would make "API only" impossible to
+    // ask for, and the panel no longer lives in this repository's roadmap.
+    if !configured.is_empty() {
+        let p = PathBuf::from(configured);
+        return p.join("index.html").is_file().then_some(p);
+    }
+
+    let mut candidates = vec![
+        "./static".to_string(),
+        "/usr/local/share/hypha/static".to_string(),
     ];
+    // Source-tree conveniences only in dev builds: a release binary that ships
+    // a compiled-in path to its own checkout is a surprise nobody wants.
+    if cfg!(debug_assertions) {
+        candidates.push("./crates/hub/static".to_string());
+        candidates.push(concat!(env!("CARGO_MANIFEST_DIR"), "/static").to_string());
+    }
+
     for c in candidates {
         let p = PathBuf::from(&c);
-        if p.join("index.html").exists() {
-            return p;
+        if p.join("index.html").is_file() {
+            return Some(p);
         }
     }
-    PathBuf::from(configured)
+    None
 }
 
 #[tokio::main]
@@ -87,11 +104,16 @@ async fn main() -> Result<()> {
     let st = AppState::new(cfg.clone(), db);
 
     let static_dir = find_static_dir(&cfg.static_dir);
-    tracing::info!("static dir: {}", static_dir.display());
+    let serves_panel = static_dir.is_some();
+    match &static_dir {
+        Some(dir) => tracing::info!("panel: serving {}", dir.display()),
+        None => tracing::info!(
+            "panel: none (api only) -- serve the panel yourself, e.g. nginx root -> mycelium/dist"
+        ),
+    }
     tracing::info!("bin dir: {}", cfg.bin_dir);
 
-    let index = static_dir.join("index.html");
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/api/meta", get(api::meta))
         .route("/api/enroll", post(api::enroll))
         .route("/api/hosts", get(api::list_hosts))
@@ -112,15 +134,27 @@ async fn main() -> Result<()> {
         .route("/agent", get(ws::upgrade))
         .route("/install.sh", get(api::install_sh))
         .route("/dl/{name}", get(api::download))
-        .route("/health", get(api::health))
-        .fallback_service(ServeDir::new(&static_dir).not_found_service(ServeFile::new(&index)))
-        .layer(TraceLayer::new_for_http())
-        .with_state(st);
+        .route("/health", get(api::health));
+
+    app = match static_dir {
+        Some(dir) => {
+            let index = dir.join("index.html");
+            app.fallback_service(ServeDir::new(&dir).not_found_service(ServeFile::new(&index)))
+        }
+        // No bundle here: answer with a pointer instead of a 404, so an empty
+        // `static_dir` is an intentional mode and not a deployment mystery.
+        None => app.fallback(api::no_panel),
+    };
+    let app = app.layer(TraceLayer::new_for_http()).with_state(st);
 
     let addr: SocketAddr = cfg.listen.parse().context("invalid --listen")?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("hypha hub listening on http://{addr}");
-    println!("  panel   http://{addr}/");
+    if serves_panel {
+        println!("  panel   http://{addr}/");
+    } else {
+        println!("  panel   not served here (api only)");
+    }
     println!("  agents  ws://{addr}/agent");
     if cfg.public_url.is_empty() {
         println!("  note: set public_url (or use --public-url) so install commands are correct behind a proxy");

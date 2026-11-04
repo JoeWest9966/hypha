@@ -1,0 +1,916 @@
+openapi: 3.1.0
+
+# hypha hub API — the contract between hyphad and any panel (mycelium lives in
+# its own repository and only speaks this file).
+#
+# Rules of engagement:
+#
+#   1. This file is the single source of truth. The Rust handlers in
+#      crates/hub/src/api.rs and the TypeScript client in mycelium are both
+#      wrong when they disagree with it.
+#   2. Breaking a shape means bumping `api_version` (see GET /api/meta).
+#      Additive fields do not bump it; consumers must ignore unknown fields.
+#   3. `scripts/check-api-contract.sh` fails the build when a route exists in
+#      the router but not here, or here but not in the router.
+#
+# There is no authentication. Authorization is the network: the hub is meant to
+# run inside Tailscale / WireGuard / loopback and must never be exposed to the
+# internet. Any caller can run commands as root on every enrolled host.
+
+info:
+  title: hypha hub API
+  version: 1.0.0
+  description: |
+    Star-topology fleet control plane. Agents dial out to `GET /agent`
+    (WebSocket); operators talk to the REST surface below.
+
+servers:
+  - url: http://127.0.0.1:5522
+    description: Local hub (default listen)
+
+tags:
+  - name: meta
+    description: Identity and version handshake.
+  - name: hosts
+    description: Enrolled machines and their presence.
+  - name: enroll
+    description: Install commands / enrollment tokens.
+  - name: exec
+    description: Command execution and its output stream.
+  - name: pty
+    description: Interactive shells.
+  - name: bootstrap
+    description: Agent installation endpoints (not part of the panel API).
+
+paths:
+  /api/meta:
+    get:
+      tags: [meta]
+      summary: Hub identity, version and fleet counters
+      description: |
+        A panel MUST call this first and refuse to run when `api_version` is
+        higher than what it was compiled against. Serving a UI that half
+        understands the API is worse than not starting.
+      operationId: getMeta
+      responses:
+        '200':
+          description: Hub metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Meta'
+
+  /api/hosts:
+    get:
+      tags: [hosts]
+      summary: List every enrolled host
+      description: |
+        `online` and `load` are computed per request from the live agent
+        registry, not stored. A host that is in the catalog but not connected
+        comes back with `online: false`.
+      operationId: listHosts
+      responses:
+        '200':
+          description: All hosts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Host'
+
+  /api/hosts/{id}:
+    delete:
+      tags: [hosts]
+      summary: Forcibly remove a host
+      description: |
+        Drops the row and asks a connected agent to shut down. The agent's
+        config on that machine still points at this hub, so a manual
+        `systemctl stop hypha-sat` may be needed to keep it from re-enrolling.
+      operationId: deleteHost
+      parameters:
+        - $ref: '#/components/parameters/HostId'
+      responses:
+        '200':
+          description: Removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/hosts/{id}/tags:
+    post:
+      tags: [hosts]
+      summary: Replace a host's tag set
+      description: |
+        Tags are the only targeting dimension exec understands, so this is how
+        a host joins a group. Replaces the whole set; send `[]` to clear.
+      operationId: setHostTags
+      parameters:
+        - $ref: '#/components/parameters/HostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tags]
+              properties:
+                tags:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Tags replaced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+
+  /api/enroll-tokens:
+    get:
+      tags: [enroll]
+      summary: List install keys
+      description: |
+        Returns every token ever created, including one-shot tokens already
+        burned and revoked keys, so the UI can show history. `install_cmd` is
+        rendered against the current request host (or `public_url`), so it
+        stays correct if the hub moves.
+      operationId: listEnrollTokens
+      responses:
+        '200':
+          description: Tokens, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EnrollTokenInfo'
+    post:
+      tags: [enroll]
+      summary: Create an install key
+      description: |
+        `reusable: false` (default) burns after one enrollment and lives 24h.
+        `reusable: true` lives 30 days and is counted, not burned — it is a
+        standing key to the fleet and should be treated as a credential.
+      operationId: createEnrollToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollTokenRequest'
+      responses:
+        '200':
+          description: The key and its install command
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnrollTokenResponse'
+
+  /api/enroll-tokens/{token}:
+    delete:
+      tags: [enroll]
+      summary: Revoke an install key
+      operationId: revokeEnrollToken
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '404':
+          description: Unknown token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /api/exec:
+    post:
+      tags: [exec]
+      summary: Run a command on selected hosts
+      description: |
+        Returns immediately with one job per matched host, online or not. A
+        host that is offline gets a job whose event stream starts with a
+        `failed` event, so the caller always has something to render.
+        Output arrives on `GET /api/exec/{id}/events`.
+      operationId: createExec
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecRequest'
+      responses:
+        '200':
+          description: Jobs created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecResponse'
+        '400':
+          description: Empty command, or no host matched the targets
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /api/exec/{id}/events:
+    get:
+      tags: [exec]
+      summary: Exec output stream (SSE)
+      description: |
+        Server-Sent Events. Every message is `event: e` and its `data` is a
+        JSON-encoded `ExecEvent`. The stream ends after one `done` event per
+        job; comment frames (`: ka`) are keep-alives and carry no payload.
+
+        There is no replay cursor: connect after `POST /api/exec` and read from
+        the start. A channel is reaped 30 minutes after creation.
+      operationId: execEvents
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Each frame is `event: e\ndata: <ExecEvent JSON>\n\n`.
+              examples:
+                started:
+                  summary: First event for a job
+                  value: |
+                    event: e
+                    data: {"kind":"started","job_id":"j_abc","host_id":"h_abc","hostname":"web-1","pid":4021}
+
+                output:
+                  summary: Base64 stdout chunk
+                  value: |
+                    event: e
+                    data: {"kind":"output","job_id":"j_abc","host_id":"h_abc","hostname":"web-1","seq":0,"stream":"stdout","data":"aGVsbG8K"}
+        '404':
+          description: Unknown or expired exec id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /api/execs:
+    get:
+      tags: [exec]
+      summary: Recent commands
+      description: Newest 50, for the panel's history list.
+      operationId: recentExecs
+      responses:
+        '200':
+          description: Recent execs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ExecRecord'
+
+  /api/pty:
+    get:
+      tags: [pty]
+      summary: Interactive shell (WebSocket)
+      description: |
+        WebSocket upgrade. Frames are JSON in both directions.
+
+        Client → hub is `TermIn`. Hub → client is `TermOut`. Note the asymmetry:
+        `TermIn.input.data` is a plain UTF-8 string (what the human typed), while
+        `TermOut.output.data` is base64 of raw terminal bytes (which are not
+        valid UTF-8 in general). Getting that backwards produces a garbled or
+        empty terminal.
+
+        The hub closes the socket with a normal close frame when the shell
+        exits; `TermOut.exit` carries the code.
+      operationId: pty
+      x-websocket: true
+      parameters:
+        - name: host_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: cols
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 80
+        - name: rows
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 24
+      responses:
+        '101':
+          description: Switching protocols
+        '400':
+          description: Missing host_id, or the host is not connected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /health:
+    get:
+      tags: [meta]
+      summary: Liveness probe
+      operationId: health
+      responses:
+        '200':
+          description: Always ok when the process is serving
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+
+  /api/enroll:
+    post:
+      tags: [bootstrap]
+      summary: Enroll a satellite
+      description: |
+        Called once by `hypha-sat` on the target machine, with the token from
+        the install command. Consumes a one-shot token, or counts a use on a
+        reusable one. The hub stores the agent's ed25519 public key; every later
+        connection must sign a fresh nonce with the matching secret key, so a
+        leaked hub database does not let anyone impersonate an agent.
+
+        Not called by the panel.
+      operationId: enroll
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollRequest'
+      responses:
+        '200':
+          description: Enrolled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnrollResponse'
+        '400':
+          description: Public key is not 32 bytes of hex
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '403':
+          description: Invalid, expired, revoked or already-used token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /install.sh:
+    get:
+      tags: [bootstrap]
+      summary: Agent installer script
+      description: |
+        Serves the install script with `__HUB__` / `__TOKEN__` substituted.
+        Used by a human on the target machine, not by the panel. Handles
+        downloads and enrolls a token; it does not authenticate the caller
+        beyond the token it is handed.
+      operationId: installScript
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Shell script
+          content:
+            text/x-shellscript:
+              schema:
+                type: string
+        '400':
+          description: Missing token
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /dl/{name}:
+    get:
+      tags: [bootstrap]
+      summary: Satellite binary
+      description: |
+        Serves files from `bin_dir`. Only names matching `[A-Za-z0-9._-]+` are
+        accepted, so no path traversal.
+      operationId: downloadBinary
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9._-]+$'
+      responses:
+        '200':
+          description: Binary
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Bad name
+          content:
+            text/plain:
+              schema:
+                type: string
+        '404':
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  parameters:
+    HostId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    InternalError:
+      description: Storage failure
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+  schemas:
+    Meta:
+      type: object
+      required: [name, version, api_version, hosts_total, hosts_online]
+      properties:
+        name:
+          type: string
+          const: hypha
+        version:
+          type: string
+          description: hyphad's crate version. Informational only.
+        api_version:
+          type: integer
+          minimum: 1
+          description: |
+            Contract version. Bumped on any breaking shape change; panels refuse
+            an api_version they do not know.
+        hosts_total:
+          type: integer
+        hosts_online:
+          type: integer
+
+    Host:
+      type: object
+      required: [id, hostname, os, arch, version, tags, created_at, last_seen, online, load]
+      properties:
+        id:
+          type: string
+          description: Hub-assigned id (`h` + 10 chars).
+        hostname:
+          type: string
+          description: What the agent reported at enrollment.
+        os:
+          type: string
+          description: '`std::env::consts::OS` on the agent, e.g. `linux`.'
+        arch:
+          type: string
+          description: '`std::env::consts::ARCH` on the agent, e.g. `x86_64`.'
+        version:
+          type: string
+          description: hypha-sat version reported at enrollment.
+        tags:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: integer
+          format: int64
+          description: Unix seconds.
+        last_seen:
+          type: integer
+          format: int64
+          description: Unix seconds, updated on each agent connection.
+        online:
+          type: boolean
+          description: Live, not stored — true when the agent socket is open now.
+        load:
+          type: number
+          format: float
+          description: 'Agent-reported load average; 0 when offline.'
+
+    EnrollRequest:
+      type: object
+      required: [token, pubkey, hostname, os, arch, version]
+      properties:
+        token:
+          type: string
+          description: Enrollment token from the install command.
+        pubkey:
+          type: string
+          description: Hex-encoded 32-byte ed25519 public key.
+          pattern: '^[0-9a-fA-F]{64}$'
+        hostname: { type: string }
+        os:
+          type: string
+          description: '`std::env::consts::OS`, e.g. `linux`.'
+        arch:
+          type: string
+          description: '`std::env::consts::ARCH`, e.g. `x86_64`.'
+        version:
+          type: string
+          description: hypha-sat's own version.
+
+    EnrollResponse:
+      type: object
+      required: [host_id, hostname, hub]
+      properties:
+        host_id:
+          type: string
+          description: Hub-assigned id, `h` + 10 chars.
+        hostname:
+          type: string
+          description: Echoed back.
+        hub:
+          type: string
+          description: Reserved; currently an empty string.
+
+    Ok:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          const: true
+
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable, not stable enough to branch on.
+
+    EnrollTokenRequest:
+      type: object
+      properties:
+        ttl_sec:
+          type: integer
+          format: int64
+          description: |
+            Clamped to 60..2592000 (30 days). Defaults to 24h for one-shot and
+            30 days for reusable.
+        tags:
+          type: array
+          items:
+            type: string
+          description: Tags applied to the host that enrolls with this key.
+        reusable:
+          type: boolean
+          default: false
+        label:
+          type: string
+          default: ''
+          description: Trimmed to 64 chars; defaults to `one-shot` or `reusable key`.
+
+    EnrollTokenResponse:
+      type: object
+      required: [token, expires_at, install_cmd, reusable, label]
+      properties:
+        token:
+          type: string
+        expires_at:
+          type: integer
+          format: int64
+        install_cmd:
+          type: string
+          description: Ready-to-paste `curl … | sudo sh` one-liner.
+        reusable:
+          type: boolean
+        label:
+          type: string
+
+    EnrollTokenInfo:
+      type: object
+      required: [token, label, tags, reusable, revoked, created_at, expires_at, uses, install_cmd]
+      properties:
+        token:
+          type: string
+        label:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        reusable:
+          type: boolean
+        revoked:
+          type: boolean
+        created_at:
+          type: integer
+          format: int64
+        expires_at:
+          type: integer
+          format: int64
+        uses:
+          type: integer
+          description: How many hosts enrolled with this key.
+        last_used_at:
+          type: integer
+          format: int64
+          nullable: true
+        install_cmd:
+          type: string
+
+    Targets:
+      type: object
+      properties:
+        hosts:
+          type: array
+          items:
+            type: string
+          default: []
+        tags:
+          type: array
+          items:
+            type: string
+          default: []
+        all:
+          type: boolean
+          default: false
+      description: |
+        A host matches when its id is listed, or it carries one of the listed
+        tags, or `all` is true — or when both lists are empty, which means
+        everything. Unions, not intersections.
+
+    ExecRequest:
+      type: object
+      required: [command]
+      properties:
+        targets:
+          $ref: '#/components/schemas/Targets'
+        command:
+          type: string
+          description: Run through the agent's `$SHELL -lc` in its own session.
+        timeout_sec:
+          type: integer
+          format: int64
+          nullable: true
+          description: Clamped to the hub's `exec_timeout_sec` (default 900), hard cap 24h.
+        cwd:
+          type: string
+          nullable: true
+
+    ExecResponse:
+      type: object
+      required: [exec_id, jobs]
+      properties:
+        exec_id:
+          type: string
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/JobRef'
+
+    JobRef:
+      type: object
+      required: [host_id, hostname, job_id]
+      properties:
+        host_id:
+          type: string
+        hostname:
+          type: string
+        job_id:
+          type: string
+
+    ExecRecord:
+      type: object
+      required: [id, command, hosts, created_at]
+      properties:
+        id:
+          type: string
+        command:
+          type: string
+        hosts:
+          type: string
+          description: Comma-joined hostnames.
+        created_at:
+          type: integer
+          format: int64
+
+    ExecEvent:
+      oneOf:
+        - $ref: '#/components/schemas/ExecStarted'
+        - $ref: '#/components/schemas/ExecOutput'
+        - $ref: '#/components/schemas/ExecExit'
+        - $ref: '#/components/schemas/ExecFailed'
+        - $ref: '#/components/schemas/ExecDone'
+      discriminator:
+        propertyName: kind
+        mapping:
+          started: '#/components/schemas/ExecStarted'
+          output: '#/components/schemas/ExecOutput'
+          exit: '#/components/schemas/ExecExit'
+          failed: '#/components/schemas/ExecFailed'
+          done: '#/components/schemas/ExecDone'
+
+    ExecStarted:
+      type: object
+      required: [kind, job_id, host_id, hostname, pid]
+      properties:
+        kind:
+          type: string
+          const: started
+        job_id: { type: string }
+        host_id: { type: string }
+        hostname: { type: string }
+        pid: { type: integer }
+
+    ExecOutput:
+      type: object
+      required: [kind, job_id, host_id, hostname, seq, stream, data]
+      properties:
+        kind:
+          type: string
+          const: output
+        job_id: { type: string }
+        host_id: { type: string }
+        hostname: { type: string }
+        seq:
+          type: integer
+          description: Per-job monotonic counter.
+        stream:
+          type: string
+          enum: [stdout, stderr]
+        data:
+          type: string
+          description: |
+            Base64 of the raw bytes. Not UTF-8 text — decoding it as a string
+            corrupts anything that is not ASCII.
+
+    ExecExit:
+      type: object
+      required: [kind, job_id, host_id, hostname, code, signal, duration_ms]
+      properties:
+        kind:
+          type: string
+          const: exit
+        job_id: { type: string }
+        host_id: { type: string }
+        hostname: { type: string }
+        code:
+          type: integer
+          nullable: true
+        signal:
+          type: integer
+          nullable: true
+        duration_ms:
+          type: integer
+
+    ExecFailed:
+      type: object
+      required: [kind, job_id, host_id, hostname, message]
+      properties:
+        kind:
+          type: string
+          const: failed
+        job_id: { type: string }
+        host_id: { type: string }
+        hostname: { type: string }
+        message:
+          type: string
+          description: '`host offline` or `host disconnected`.'
+
+    ExecDone:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          const: done
+
+    TermIn:
+      oneOf:
+        - $ref: '#/components/schemas/TermInput'
+        - $ref: '#/components/schemas/TermResize'
+        - $ref: '#/components/schemas/TermClose'
+      discriminator:
+        propertyName: t
+        mapping:
+          input: '#/components/schemas/TermInput'
+          resize: '#/components/schemas/TermResize'
+          close: '#/components/schemas/TermClose'
+
+    TermInput:
+      type: object
+      required: [t, data]
+      properties:
+        t:
+          type: string
+          const: input
+        data:
+          type: string
+          description: Plain UTF-8 keystrokes, not base64.
+
+    TermResize:
+      type: object
+      required: [t, cols, rows]
+      properties:
+        t:
+          type: string
+          const: resize
+        cols: { type: integer }
+        rows: { type: integer }
+
+    TermClose:
+      type: object
+      required: [t]
+      properties:
+        t:
+          type: string
+          const: close
+
+    TermOut:
+      oneOf:
+        - $ref: '#/components/schemas/TermOutput'
+        - $ref: '#/components/schemas/TermExit'
+        - $ref: '#/components/schemas/TermError'
+      discriminator:
+        propertyName: t
+        mapping:
+          output: '#/components/schemas/TermOutput'
+          exit: '#/components/schemas/TermExit'
+          error: '#/components/schemas/TermError'
+
+    TermOutput:
+      type: object
+      required: [t, data]
+      properties:
+        t:
+          type: string
+          const: output
+        data:
+          type: string
+          description: |
+            Base64 of raw terminal bytes. Write it straight into the emulator
+            as a byte array; do not decode to a JS string.
+
+    TermExit:
+      type: object
+      required: [t, code]
+      properties:
+        t:
+          type: string
+          const: exit
+        code:
+          type: integer
+          nullable: true
+
+    TermError:
+      type: object
+      required: [t, message]
+      properties:
+        t:
+          type: string
+          const: error
+        message:
+          type: string
