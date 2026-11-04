@@ -2,9 +2,6 @@
 (function () {
   'use strict';
 
-  var TOKEN_KEY = 'hypha.token';
-  var token = localStorage.getItem(TOKEN_KEY) || '';
-
   var $ = function (id) { return document.getElementById(id); };
 
   // ── base64 → bytes → utf-8 string ────────────────────────────────────
@@ -30,7 +27,6 @@
   function api(path, opts) {
     opts = opts || {};
     var headers = { 'Accept': 'application/json' };
-    if (token) headers['Authorization'] = 'Bearer ' + token;
     if (opts.body !== undefined && opts.raw === undefined) {
       headers['Content-Type'] = 'application/json';
     }
@@ -42,10 +38,6 @@
         : (opts.raw ? opts.body : JSON.stringify(opts.body))
     }).then(function (res) {
       var ct = res.headers.get('content-type') || '';
-      if (res.status === 401) {
-        logout(true);
-        throw new Error('unauthorized');
-      }
       if (!res.ok) {
         return res.text().then(function (t) {
           var msg = t;
@@ -77,47 +69,8 @@
     return state.hosts.filter(function (h) { return state.selected[h.id]; });
   }
 
-  // ── login ────────────────────────────────────────────────────────────
-  function doLogin(password) {
-    return fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: password })
-    }).then(function (res) {
-      if (!res.ok) {
-        return res.json().catch(function () {
-          return { error: res.status + ' ' + res.statusText };
-        }).then(function (j) { throw new Error(j.error || 'login failed'); });
-      }
-      return res.json();
-    });
-  }
-
-  function logout(silent) {
-    localStorage.removeItem(TOKEN_KEY);
-    token = '';
-    state.hosts = [];
-    state.selected = {};
-    $('app').hidden = true;
-    $('login').hidden = false;
-    $('login-password').value = '';
-    if (!silent) toast('logged out', 'info');
-    setTimeout(function () { $('login-password').focus(); }, 0);
-  }
-
   function boot() {
-    if (!token) {
-      $('login').hidden = false;
-      return;
-    }
-    // a stale token is caught by the first authenticated call
-    api('/api/hosts').then(function () { enterApp(); })
-      .catch(function () { $('login').hidden = false; });
-  }
-
-  function enterApp() {
-    $('login').hidden = true;
-    $('app').hidden = false;
+    // No login: the private network is the boundary. See crates/hub/src/api.rs.
     loadHosts().then(updateRunHint);
   }
 
@@ -363,8 +316,7 @@
   }
 
   function listenExec(execId, jobs) {
-    var es = new EventSource('/api/exec/' + encodeURIComponent(execId) + '/events?token=' +
-      encodeURIComponent(token));
+    var es = new EventSource('/api/exec/' + encodeURIComponent(execId) + '/events');
 
     var startedAt = {};
     jobs.forEach(function (j) { startedAt[j.job_id] = Date.now(); });
@@ -527,8 +479,7 @@
     fitTerm();
 
     var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    var url = proto + location.host + '/api/pty?token=' + encodeURIComponent(token) +
-      '&host_id=' + encodeURIComponent(host.id) +
+    var url = proto + location.host + '/api/pty?host_id=' + encodeURIComponent(host.id) +
       '&cols=' + cols + '&rows=' + rows;
 
     var ws = new WebSocket(url);
@@ -598,24 +549,6 @@
   }
 
   // ── wiring ───────────────────────────────────────────────────────────
-  $('login-form').addEventListener('submit', function (ev) {
-    ev.preventDefault();
-    var err = $('login-error');
-    err.hidden = true;
-    var btn = $('login-submit');
-    btn.disabled = true;
-    doLogin($('login-password').value).then(function (r) {
-      token = r.token;
-      localStorage.setItem(TOKEN_KEY, token);
-      enterApp();
-    }).catch(function (e) {
-      err.textContent = e.message;
-      err.hidden = false;
-      $('login-password').select();
-    }).then(function () { btn.disabled = false; });
-  });
-
-  $('logout-btn').addEventListener('click', function () { logout(false); });
   $('refresh-btn').addEventListener('click', function () {
     loadHosts().then(updateRunHint);
   });

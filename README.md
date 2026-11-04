@@ -50,13 +50,12 @@ sudo mkdir -p /var/lib/hypha
 sudo ./target/release/hyphad --listen 0.0.0.0:5522 --public-url https://hub.example.com
 ```
 
-On first boot it prints a generated admin password **once**. Change it later:
+**There is no login.** The hub assumes it is reachable only from a private
+network (Tailscale, WireGuard, loopback). Anybody who can reach port 5522 can
+run commands as root on every enrolled host — so don't expose it to the
+internet. If you need a public hub, put an auth proxy in front of it.
 
-```sh
-hyphad --set-password 'something-long'
-```
-
-Put TLS in front of it. Caddy is one line (`dist/Caddyfile`):
+For a public hub, put TLS in front of it. Caddy is one line (`dist/Caddyfile`):
 
 ```
 hub.example.com {
@@ -81,7 +80,7 @@ unit, starts it. The host appears in the panel in about a second.
 ### 4. use it
 
 ```sh
-hypha login --hub https://hub.example.com
+hypha use https://hub.example.com
 hypha hosts
 hypha run -- 'uptime'                       # every host
 hypha run web01 db01 -- 'systemctl status nginx'
@@ -111,9 +110,9 @@ The agent never listens on a port and never talks to anything except the hub.
   and don't put it on a coffee-shop wifi.
 - Auth is per-agent ed25519 keys (a shared secret would let one agent impersonate
   another — we don't do that).
-- Panel/CLI auth is a single admin password → bearer token. There is no RBAC
-  because there is no team. Add it when you have one.
-- `audit` table records logins, enrollments, and every command. Tail it.
+- **There is no panel/CLI auth.** The network is the boundary. Agent auth is
+  still real (ed25519), so a random host cannot join your fleet.
+- `audit` table records enrollments and every command. Tail it.
 - **Keep an out-of-band way in** (ssh, cloud console). A tool that becomes your
   only door and then breaks is worse than ssh.
 

@@ -34,8 +34,7 @@ function makeFetch(log) {
     log.push(method + ' ' + u);
     const body = opts.body && typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body;
     let payload = null;
-    if (u.endsWith('/api/login')) payload = { token: 't_test', hub: '' };
-    else if (u.endsWith('/api/hosts')) payload = HOSTS;
+    if (u.endsWith('/api/hosts')) payload = HOSTS;
     else if (u.endsWith('/api/exec')) {
       payload = { exec_id: 'x_1', jobs: [{ host_id: 'h_1', hostname: 'web01', job_id: 'j_1' }] };
     } else if (u.includes('/api/enroll-tokens')) {
@@ -99,27 +98,18 @@ class FakeWebSocket {
   w.eval(appjs);
   await sleep(50);
 
-  console.log('\nlogin');
-  check('login screen shown', !d.getElementById('login').hidden);
-  check('app hidden', d.getElementById('app').hidden);
+  console.log('\nboot (no login)');
+  check('app visible immediately', !d.getElementById('app').hidden);
   const vis = (id) => w.getComputedStyle(d.getElementById(id)).display;
-  check('login actually visible', vis('login') !== 'none', 'display=' + vis('login'));
-  check('app actually hidden', vis('app') === 'none', 'display=' + vis('app'));
+  check('app actually visible', vis('app') !== 'none', 'display=' + vis('app'));
   check('add modal hidden', vis('add-modal') === 'none', 'display=' + vis('add-modal'));
   check('delete modal hidden', vis('del-modal') === 'none', 'display=' + vis('del-modal'));
   check('term overlay hidden', vis('term-overlay') === 'none', 'display=' + vis('term-overlay'));
   check('empty states hidden', vis('hosts-empty') === 'none' && vis('results-empty') === 'none');
-
-  d.getElementById('login-password').value = 'secret';
-  d.getElementById('login-form').dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
-  await sleep(100);
-
-  check('token stored', !!w.localStorage.getItem('hypha.token'));
-  check('app visible after login', !d.getElementById('app').hidden);
+  check('no password field', !d.querySelector('input[type=password]'));
   check('two host rows rendered', d.querySelectorAll('.host-row').length === 2,
         String(d.querySelectorAll('.host-row').length));
-  check('online count in header', /1 online|online 1/.test(d.getElementById('fleet-stats').textContent) ||
-        d.getElementById('fleet-stats').textContent.includes('1'),
+  check('online count in header', d.getElementById('fleet-stats').textContent.includes('1'),
         d.getElementById('fleet-stats').textContent);
   check('tags rendered', d.body.textContent.includes('prod'));
   check('load rendered', /0\.42/.test(d.body.textContent));
@@ -135,7 +125,7 @@ class FakeWebSocket {
   check('exec posted', apiLog.some(l => l.startsWith('POST /api/exec')), JSON.stringify(apiLog));
   check('result pane created', !!d.getElementById('out-j_1'), d.body.innerHTML.includes('out-'));
   console.log('  toasts:', d.getElementById('toasts').textContent.trim());
-  check('sse opened', lastES && lastES.url.includes('/api/exec/x_1/events?token='),
+  check('sse opened without token', lastES && lastES.url === '/api/exec/x_1/events',
         lastES && lastES.url);
 
   lastES.emit('e', { kind: 'started', job_id: 'j_1', host_id: 'h_1', hostname: 'web01', pid: 42 });

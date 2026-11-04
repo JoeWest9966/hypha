@@ -19,8 +19,6 @@ pub struct Config {
     pub data_dir: String,
     pub bin_dir: String,
     pub static_dir: String,
-    /// Override the admin password on boot (otherwise one is generated once).
-    pub password: Option<String>,
     /// Hard cap for a single exec, seconds. Agents get the same value.
     pub exec_timeout_sec: u64,
 }
@@ -33,7 +31,6 @@ impl Default for Config {
             data_dir: "/var/lib/hypha".into(),
             bin_dir: "./bin".into(),
             static_dir: "./static".into(),
-            password: None,
             exec_timeout_sec: 900,
         }
     }

@@ -1,7 +1,7 @@
 //! HTTP API + SSE + static panel.
 
 use crate::state::{AppState, ExecChannel};
-use crate::util::{gen_id, verify_password};
+use crate::util::gen_id;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -23,26 +23,13 @@ pub fn err<T>(code: StatusCode, msg: impl Into<String>) -> Result<T, ApiErr> {
 type Api<T> = Result<Json<T>, ApiErr>;
 
 // ---------------------------------------------------------------------------
-// auth
+// access control
+//
+// There is deliberately no login. The hub is meant to sit inside a private
+// network (Tailscale / WireGuard / loopback) and the network is the boundary.
+// Do not expose port 5522 to the internet: an unauthenticated caller can run
+// arbitrary commands as root on every enrolled host.
 // ---------------------------------------------------------------------------
-
-pub fn token_of(headers: &HeaderMap, query: &HashMap<String, String>) -> Option<String> {
-    if let Some(h) = headers.get(header::AUTHORIZATION) {
-        if let Ok(s) = h.to_str() {
-            if let Some(rest) = s.strip_prefix("Bearer ") {
-                return Some(rest.trim().to_string());
-            }
-        }
-    }
-    query.get("token").cloned().filter(|t| !t.is_empty())
-}
-
-pub fn require(state: &AppState, headers: &HeaderMap, query: &HashMap<String, String>) -> Result<(), ApiErr> {
-    match token_of(headers, query) {
-        Some(t) if state.db.valid_api_token(&t) => Ok(()),
-        _ => err(StatusCode::UNAUTHORIZED, "unauthorized"),
-    }
-}
 
 fn public_base(state: &AppState, headers: &HeaderMap) -> String {
     if !state.cfg.public_url.is_empty() {
@@ -72,23 +59,6 @@ pub async fn meta(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "hosts_total": hosts.len(),
         "hosts_online": online,
-    }))
-}
-
-pub async fn login(
-    State(st): State<Arc<AppState>>,
-    Json(req): Json<LoginRequest>,
-) -> Api<LoginResponse> {
-    let hash = st.db.get_setting("password_hash").unwrap_or_default();
-    if !verify_password(&req.password, &hash) {
-        return err(StatusCode::UNAUTHORIZED, "wrong password");
-    }
-    let token = gen_id("t", 32);
-    st.db.add_api_token(&token, "admin");
-    st.db.audit("auth.login", "", "");
-    Ok(Json(LoginResponse {
-        token,
-        hub: String::new(),
     }))
 }
 
@@ -129,12 +99,7 @@ pub async fn enroll(State(st): State<Arc<AppState>>, Json(req): Json<EnrollReque
 // hosts
 // ---------------------------------------------------------------------------
 
-pub async fn list_hosts(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(q): Query<HashMap<String, String>>,
-) -> Api<Vec<Host>> {
-    require(&st, &headers, &q)?;
+pub async fn list_hosts(State(st): State<Arc<AppState>>) -> Api<Vec<Host>> {
     let mut hosts = st.db.list_hosts().unwrap_or_default();
     let agents = st.agents.read().await;
     for h in hosts.iter_mut() {
@@ -148,10 +113,8 @@ pub async fn list_hosts(
 
 pub async fn delete_host(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Api<serde_json::Value> {
-    require(&st, &headers, &HashMap::new())?;
     if let Some(a) = st.agent(&id).await {
         a.send(HubMsg::Shutdown);
     }
@@ -161,11 +124,9 @@ pub async fn delete_host(
 
 pub async fn set_tags(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Api<serde_json::Value> {
-    require(&st, &headers, &HashMap::new())?;
     let tags: Vec<String> = body
         .get("tags")
         .and_then(|v| v.as_array())
@@ -181,7 +142,6 @@ pub async fn create_enroll_token(
     headers: HeaderMap,
     Json(req): Json<EnrollTokenRequest>,
 ) -> Api<EnrollTokenResponse> {
-    require(&st, &headers, &HashMap::new())?;
     let ttl = req.ttl_sec.unwrap_or(86400).clamp(60, 60 * 60 * 24 * 30);
     let token = gen_id("e", 24);
     let tags = req.tags.unwrap_or_default();
@@ -201,10 +161,8 @@ pub async fn create_enroll_token(
 
 pub async fn create_exec(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(req): Json<ExecRequest>,
 ) -> Api<ExecResponse> {
-    require(&st, &headers, &HashMap::new())?;
     if req.command.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "empty command");
     }
@@ -313,11 +271,8 @@ pub async fn create_exec(
 
 pub async fn exec_events(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
     Path(exec_id): Path<String>,
-    Query(q): Query<HashMap<String, String>>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>, Response> {
-    require(&st, &headers, &q).map_err(|e| e.into_response())?;
     let chan = st.execs.read().await.get(&exec_id).cloned().ok_or_else(|| {
         (StatusCode::NOT_FOUND, Json(ApiError { error: "unknown exec".into() })).into_response()
     })?;
@@ -352,12 +307,7 @@ pub async fn exec_events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-pub async fn recent_execs(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(q): Query<HashMap<String, String>>,
-) -> Api<Vec<serde_json::Value>> {
-    require(&st, &headers, &q)?;
+pub async fn recent_execs(State(st): State<Arc<AppState>>) -> Api<Vec<serde_json::Value>> {
     Ok(Json(st.db.recent_execs(50)))
 }
 
@@ -367,13 +317,9 @@ pub async fn recent_execs(
 
 pub async fn pty(
     State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if let Err(e) = require(&st, &headers, &q) {
-        return e.into_response();
-    }
     let host_id = q.get("host_id").cloned().unwrap_or_default();
     let cols: u16 = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(80);
     let rows: u16 = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(24);

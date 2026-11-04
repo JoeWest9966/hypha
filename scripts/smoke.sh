@@ -28,8 +28,7 @@ cat > "$TMP/hub.json" <<EOF
   "public_url": "${HUB}",
   "data_dir": "${TMP}/data",
   "bin_dir": "${TMP}/bin",
-  "static_dir": "$(pwd)/crates/hub/static",
-  "password": "smoke"
+  "static_dir": "$(pwd)/crates/hub/static"
 }
 EOF
 mkdir -p "$TMP/bin"
@@ -42,12 +41,10 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 
-say "logging in"
-"$BIN/hypha" login --hub "$HUB" --password smoke > /dev/null
+say "pointing cli at the hub"
+"$BIN/hypha" use "$HUB" > /dev/null
 
-TOKEN="$(python3 -c 'import json,os;print(json.load(open(os.environ["HYPHA_CONFIG"]))["token"])')"
-ENROLL="$(curl -sf -X POST "$HUB/api/enroll-tokens" \
-    -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+ENROLL="$(curl -sf -X POST "$HUB/api/enroll-tokens" -H 'content-type: application/json' \
     -d '{"ttl_sec":600,"tags":["smoke"]}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')"
 
 say "enrolling local satellite"
@@ -85,7 +82,7 @@ import sqlite3, sys, os
 db = sqlite3.connect(os.path.join(sys.argv[1], "data", "hypha.db"))
 rows = db.execute("select action from audit").fetchall()
 actions = {r[0] for r in rows}
-for need in ("host.enroll", "exec", "auth.login"):
+for need in ("host.enroll", "exec", "enroll.token"):
     assert need in actions, f"missing audit action {need}: {actions}"
 print("  audit ok:", sorted(actions))
 PY

@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use hypha_proto::*;
 use serde_json::json;
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -25,11 +25,8 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Store a hub + token in your local config.
-    Login {
-        #[arg(long)]
-        password: Option<String>,
-    },
+    /// Set the hub URL in your local config (no credentials needed).
+    Use { hub_url: Option<String> },
     /// List hosts.
     Hosts,
     /// Create a one-time enroll token and print the install command.
@@ -77,7 +74,6 @@ struct RunArgs {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 struct Config {
     hub: String,
-    token: String,
 }
 
 fn config_path(args: &Args) -> PathBuf {
@@ -94,7 +90,7 @@ fn config_path(args: &Args) -> PathBuf {
 fn load_config(args: &Args) -> Result<Config> {
     let p = config_path(args);
     let raw = std::fs::read_to_string(&p)
-        .with_context(|| format!("not logged in — run `hypha login --hub <url>` (looked at {})", p.display()))?;
+        .with_context(|| format!("no hub configured — run `hypha use <url>` (looked at {})", p.display()))?;
     Ok(serde_json::from_str(&raw)?)
 }
 
@@ -181,9 +177,9 @@ impl Paint {
 async fn main() -> Result<()> {
     let mut args = Args::parse();
     let paint = Paint(!args.no_color && std::env::var("NO_COLOR").is_err());
-    // `login` is the only command that works without a config.
-    if let Cmd::Login { password } = &args.cmd {
-        return login(&args, password.clone(), &paint).await;
+    // `use` is the only command that works without a config.
+    if let Cmd::Use { hub_url } = &args.cmd {
+        return set_hub(&args, hub_url.clone(), &paint).await;
     }
     let mut cfg = load_config(&args)?;
     if let Some(h) = &args.hub {
@@ -192,7 +188,7 @@ async fn main() -> Result<()> {
 
     let cmd = std::mem::replace(&mut args.cmd, Cmd::History);
     match cmd {
-        Cmd::Login { .. } => unreachable!(),
+        Cmd::Use { .. } => unreachable!(),
         Cmd::Hosts => hosts(&args, &cfg, &paint).await,
         Cmd::Add { ttl, tags } => add(&args, &cfg, &paint, ttl, tags).await,
         Cmd::Run(run) => run_cmd(&args, &cfg, &paint, *run).await,
@@ -202,84 +198,28 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn login(args: &Args, password: Option<String>, paint: &Paint) -> Result<()> {
-    let hub = args
-        .hub
-        .clone()
-        .context("usage: hypha login --hub https://hub.example.com")?;
-    let password = match password {
-        Some(p) => p,
-        None => {
-            eprint!("password: ");
-            std::io::stderr().flush().ok();
-            rpassword_fallback()?
-        }
-    };
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/api/login", hub.trim_end_matches('/')))
-        .json(&json!({ "password": password }))
-        .send()
-        .await?;
+async fn set_hub(args: &Args, url: Option<String>, paint: &Paint) -> Result<()> {
+    let hub = url
+        .or_else(|| args.hub.clone())
+        .context("usage: hypha use https://hub.example.com")?
+        .trim_end_matches('/')
+        .to_string();
+    // Touch the hub so a typo fails now instead of on the first `run`.
+    let resp = reqwest::get(format!("{hub}/api/meta")).await?;
     if !resp.status().is_success() {
-        bail!("login failed: {}", resp.text().await.unwrap_or_default());
+        bail!("hub at {hub} returned {}", resp.status());
     }
-    let out: LoginResponse = resp.json().await?;
-    save_config(
-        args,
-        &Config {
-            hub: hub.trim_end_matches('/').to_string(),
-            token: out.token,
-        },
-    )?;
-    eprintln!("{} logged in to {}", paint.green("ok"), hub);
+    save_config(args, &Config { hub: hub.clone() })?;
+    eprintln!("{} using {}", paint.green("ok"), hub);
     Ok(())
 }
 
-/// Read a line from /dev/tty without echoing, no extra crate for one prompt.
-fn rpassword_fallback() -> Result<String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty")?;
-        let fd = tty.as_raw_fd();
-        let mut term: libc::termios = unsafe { std::mem::zeroed() };
-        unsafe { libc::tcgetattr(fd, &mut term) };
-        let orig = term;
-        term.c_lflag &= !libc::ECHO;
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) };
-        let mut line = String::new();
-        let mut reader = std::io::BufReader::new(tty.try_clone()?);
-        let res = reader.read_line(&mut line);
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
-        eprintln!();
-        res?;
-        Ok(line.trim_end().to_string())
-    }
-    #[cfg(not(unix))]
-    {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        Ok(line.trim_end().to_string())
-    }
-}
-
-fn client_with(cfg: &Config) -> reqwest::Client {
-    let mut headers = reqwest::header::HeaderMap::new();
-    if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", cfg.token)) {
-        headers.insert(reqwest::header::AUTHORIZATION, v);
-    }
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+fn client_with(_cfg: &Config) -> reqwest::Client {
+    reqwest::Client::new()
 }
 
 async fn fetch_hosts(hub: &str, cfg: &Config) -> Result<Vec<Host>> {
     let resp = client_with(cfg).get(format!("{hub}/api/hosts")).send().await?;
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        bail!("token rejected — run `hypha login` again");
-    }
     if !resp.status().is_success() {
         bail!("hub error: {}", resp.text().await.unwrap_or_default());
     }
@@ -472,10 +412,7 @@ async fn run_cmd(args: &Args, cfg: &Config, paint: &Paint, run: RunArgs) -> Resu
     let prefix = !run.quiet && exec.jobs.len() > 1;
     let width = exec.jobs.iter().map(|j| j.hostname.len()).max().unwrap_or(0).min(24);
 
-    let url = format!(
-        "{hub}/api/exec/{}/events?token={}",
-        exec.exec_id, cfg.token
-    );
+    let url = format!("{hub}/api/exec/{}/events", exec.exec_id);
     let resp = reqwest::get(&url).await?;
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
@@ -589,9 +526,8 @@ async fn shell(args: &Args, cfg: &Config, paint: &Paint, host: String) -> Result
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((100, 30));
     let url = format!(
-        "{}/api/pty?token={}&host_id={}&cols={}&rows={}",
+        "{}/api/pty?host_id={}&cols={}&rows={}",
         ws_base(&hub),
-        urlencoding::encode(&cfg.token),
         urlencoding::encode(&target.id),
         cols,
         rows

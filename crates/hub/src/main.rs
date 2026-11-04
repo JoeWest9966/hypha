@@ -25,9 +25,6 @@ struct Args {
     config: PathBuf,
     #[arg(long)]
     listen: Option<String>,
-    /// Set/replace the admin password, then exit.
-    #[arg(long)]
-    set_password: Option<String>,
     #[arg(long)]
     data_dir: Option<String>,
     #[arg(long)]
@@ -54,28 +51,6 @@ fn find_static_dir(configured: &str) -> PathBuf {
         }
     }
     PathBuf::from(configured)
-}
-
-fn bootstrap_password(st: &AppState, cfg_password: Option<&str>) {
-    match st.db.get_setting("password_hash") {
-        Some(_) => {}
-        None => {
-            let pw = cfg_password.map(str::to_string).unwrap_or_else(util::random_password);
-            st.db.set_setting("password_hash", &util::hash_password(&pw));
-            print_banner_password(&pw);
-        }
-    }
-}
-
-fn print_banner_password(pw: &str) {
-    eprintln!();
-    eprintln!("  ┌──────────────────────────────────────────────────────┐");
-    eprintln!("  │  admin password (shown once, change it if you care)  │");
-    eprintln!("  │                                                      │");
-    eprintln!("  │      {pw:<48}│");
-    eprintln!("  │                                                      │");
-    eprintln!("  └──────────────────────────────────────────────────────┘");
-    eprintln!();
 }
 
 #[tokio::main]
@@ -111,13 +86,6 @@ async fn main() -> Result<()> {
     let db = db::Db::open(&db_path)?;
     let st = AppState::new(cfg.clone(), db);
 
-    if let Some(pw) = &args.set_password {
-        st.db.set_setting("password_hash", &util::hash_password(pw));
-        eprintln!("password updated");
-        return Ok(());
-    }
-    bootstrap_password(&st, cfg.password.as_deref());
-
     let static_dir = find_static_dir(&cfg.static_dir);
     tracing::info!("static dir: {}", static_dir.display());
     tracing::info!("bin dir: {}", cfg.bin_dir);
@@ -125,7 +93,6 @@ async fn main() -> Result<()> {
     let index = static_dir.join("index.html");
     let app = Router::new()
         .route("/api/meta", get(api::meta))
-        .route("/api/login", post(api::login))
         .route("/api/enroll", post(api::enroll))
         .route("/api/hosts", get(api::list_hosts))
         .route("/api/hosts/{id}", delete(api::delete_host))

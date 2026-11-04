@@ -11,7 +11,6 @@ path = "src/main.rs"
 [dependencies]
 hypha-proto = { path = "../proto" }
 anyhow = { workspace = true }
-argon2 = "0.5"
 axum = { version = "0.8", features = ["ws", "macros"] }
 async-stream = "0.3"
 base64 = { workspace = true }

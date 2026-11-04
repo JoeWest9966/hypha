@@ -198,17 +198,6 @@ pub struct Host {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoginRequest {
-    pub password: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoginResponse {
-    pub token: String,
-    pub hub: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollTokenRequest {
     pub ttl_sec: Option<i64>,
     pub tags: Option<Vec<String>>,

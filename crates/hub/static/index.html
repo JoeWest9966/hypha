@@ -10,23 +10,8 @@
 </head>
 <body>
 
-<!-- ───────────────────────── login ───────────────────────── -->
-<div class="login" id="login">
-  <form class="login-card" id="login-form" autocomplete="off">
-    <div class="wordmark wordmark-lg">hypha</div>
-    <p class="login-tag">one binary. your whole fleet.</p>
-    <label class="field">
-      <span class="field-label">Password</span>
-      <input type="password" id="login-password" autocomplete="current-password"
-             placeholder="hub password" autofocus required>
-    </label>
-    <p class="login-error" id="login-error" role="alert" hidden></p>
-    <button type="submit" class="btn btn-primary btn-block" id="login-submit">Unlock</button>
-  </form>
-</div>
-
 <!-- ───────────────────────── app ───────────────────────── -->
-<div class="app" id="app" hidden>
+<div class="app" id="app">
 
   <header class="topbar">
     <div class="topbar-left">
@@ -35,7 +20,6 @@
     </div>
     <div class="topbar-right">
       <button class="btn btn-ghost" id="refresh-btn" aria-label="Refresh host list">Refresh</button>
-      <button class="btn btn-ghost" id="logout-btn" aria-label="Log out">Log out</button>
     </div>
   </header>
 

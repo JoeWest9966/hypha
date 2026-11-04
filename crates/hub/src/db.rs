@@ -48,10 +48,6 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS settings (
-                k TEXT PRIMARY KEY,
-                v TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS hosts (
                 id         TEXT PRIMARY KEY,
                 hostname   TEXT NOT NULL,
@@ -72,11 +68,6 @@ impl Db {
                 used_at    INTEGER,
                 used_by    TEXT
             );
-            CREATE TABLE IF NOT EXISTS api_tokens (
-                token      TEXT PRIMARY KEY,
-                label      TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS execs (
                 id         TEXT PRIMARY KEY,
                 command    TEXT NOT NULL,
@@ -96,30 +87,6 @@ impl Db {
             "#,
         )?;
         Ok(())
-    }
-
-    // --- settings ---------------------------------------------------------
-
-    pub fn get_setting(&self, k: &str) -> Option<String> {
-        self.conn
-            .lock()
-            .unwrap()
-            .query_row("SELECT v FROM settings WHERE k = ?1", params![k], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()
-            .ok()
-            .flatten()
-    }
-
-    pub fn set_setting(&self, k: &str, v: &str) {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO settings (k, v) VALUES (?1, ?2)
-             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            params![k, v],
-        )
-        .ok();
     }
 
     // --- hosts ------------------------------------------------------------
@@ -248,34 +215,6 @@ impl Db {
         )
         .ok()?;
         Some(parse_tags(&tags))
-    }
-
-    // --- api tokens -------------------------------------------------------
-
-    pub fn add_api_token(&self, token: &str, label: &str) {
-        self.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO api_tokens (token, label, created_at) VALUES (?1, ?2, ?3)",
-                params![token, label, now()],
-            )
-            .ok();
-    }
-
-    pub fn valid_api_token(&self, token: &str) -> bool {
-        self.conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT 1 FROM api_tokens WHERE token = ?1",
-                params![token],
-                |_| Ok(()),
-            )
-            .optional()
-            .ok()
-            .flatten()
-            .is_some()
     }
 
     // --- audit ------------------------------------------------------------
