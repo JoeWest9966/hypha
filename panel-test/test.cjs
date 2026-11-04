@@ -5,7 +5,11 @@ const path = require('path');
 const { JSDOM } = require('jsdom');
 
 const STATIC = path.join(__dirname, '..', 'crates', 'hub', 'static');
-const html = fs.readFileSync(path.join(STATIC, 'index.html'), 'utf8');
+let html = fs.readFileSync(path.join(STATIC, 'index.html'), 'utf8');
+// jsdom does not apply external stylesheets; inline the real CSS so cascade
+// bugs (like [hidden] losing to .login{display:grid}) are actually caught.
+const css = fs.readFileSync(path.join(STATIC, 'css', 'app.css'), 'utf8');
+html = html.replace('</head>', '<style>' + css + '</style></head>');
 const appjs = fs.readFileSync(path.join(STATIC, 'js', 'app.js'), 'utf8');
 
 let failures = 0;
@@ -98,6 +102,13 @@ class FakeWebSocket {
   console.log('\nlogin');
   check('login screen shown', !d.getElementById('login').hidden);
   check('app hidden', d.getElementById('app').hidden);
+  const vis = (id) => w.getComputedStyle(d.getElementById(id)).display;
+  check('login actually visible', vis('login') !== 'none', 'display=' + vis('login'));
+  check('app actually hidden', vis('app') === 'none', 'display=' + vis('app'));
+  check('add modal hidden', vis('add-modal') === 'none', 'display=' + vis('add-modal'));
+  check('delete modal hidden', vis('del-modal') === 'none', 'display=' + vis('del-modal'));
+  check('term overlay hidden', vis('term-overlay') === 'none', 'display=' + vis('term-overlay'));
+  check('empty states hidden', vis('hosts-empty') === 'none' && vis('results-empty') === 'none');
 
   d.getElementById('login-password').value = 'secret';
   d.getElementById('login-form').dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));

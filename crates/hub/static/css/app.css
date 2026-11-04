@@ -18,6 +18,10 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute is a UA rule with lower specificity than any class
+   below, so every display:* class silently un-hides itself. Keep it winning. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;
