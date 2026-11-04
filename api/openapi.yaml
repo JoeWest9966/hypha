@@ -314,17 +314,17 @@ paths:
         - name: cols
           in: query
           required: false
+          description: Optional, defaults to 80.
           schema:
             type: integer
             minimum: 1
-            default: 80
         - name: rows
           in: query
           required: false
+          description: Optional, defaults to 24.
           schema:
             type: integer
             minimum: 1
-            default: 24
       responses:
         '101':
           description: Switching protocols
@@ -606,11 +606,13 @@ components:
           description: Tags applied to the host that enrolls with this key.
         reusable:
           type: boolean
-          default: false
+          description: |
+            Optional, defaults to false. Reusable keys are counted instead of
+            burned and live 30 days.
         label:
           type: string
-          default: ''
-          description: Trimmed to 64 chars; defaults to `one-shot` or `reusable key`.
+          description: |
+            Optional, defaults to `one-shot` or `reusable key`. Trimmed to 64 chars.
 
     EnrollTokenResponse:
       type: object
@@ -668,15 +670,15 @@ components:
           type: array
           items:
             type: string
-          default: []
+          description: Optional; omitting it is the same as an empty list.
         tags:
           type: array
           items:
             type: string
-          default: []
+          description: Optional; omitting it is the same as an empty list.
         all:
           type: boolean
-          default: false
+          description: Optional, defaults to false.
       description: |
         A host matches when its id is listed, or it carries one of the listed
         tags, or `all` is true — or when both lists are empty, which means

@@ -1,7 +1,0 @@
-{
-  "name": "hypha-panel-test",
-  "private": true,
-  "description": "Headless DOM test for the hypha panel (jsdom, no browser)",
-  "scripts": { "test": "node test.cjs" },
-  "devDependencies": { "jsdom": "^30.0.0" }
-}

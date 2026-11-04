@@ -1,4 +1,4 @@
-//! hyphad — the hub. Panel, API, agent rendezvous. One static binary.
+//! hyphad — the hub. API, agent rendezvous, installer channel. No UI.
 
 mod api;
 mod db;
@@ -50,16 +50,10 @@ fn find_static_dir(configured: &str) -> Option<PathBuf> {
         return p.join("index.html").is_file().then_some(p);
     }
 
-    let mut candidates = vec![
-        "./static".to_string(),
-        "/usr/local/share/hypha/static".to_string(),
-    ];
-    // Source-tree conveniences only in dev builds: a release binary that ships
-    // a compiled-in path to its own checkout is a surprise nobody wants.
-    if cfg!(debug_assertions) {
-        candidates.push("./crates/hub/static".to_string());
-        candidates.push(concat!(env!("CARGO_MANIFEST_DIR"), "/static").to_string());
-    }
+    // The panel is a separate project now; this repository ships no bundle. A
+    // configured path is the only thing tried first, then the conventional
+    // install location for a bundle someone dropped next to the binary.
+    let candidates = ["./static".to_string(), "/usr/local/share/hypha/static".to_string()];
 
     for c in candidates {
         let p = PathBuf::from(&c);

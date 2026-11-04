@@ -9,15 +9,15 @@ Everything you do — run a command on 40 boxes, open a shell, watch the output
 stream — goes over that one long-lived connection.
 
 ```
-                    ┌──────────────────────┐
-   you ──browser──► │        hyphad        │ ◄── your CLI
-                    │  panel · api · audit │
-                    └──────────┬───────────┘
-                 outbound ws   │   outbound ws
-              ┌────────────────┼────────────────┐
-           ┌──▼───┐         ┌──▼───┐         ┌──▼───┐
-           │ sat  │         │ sat  │         │ sat  │
-           └──────┘         └──────┘         └──────┘
+   you ──browser──► ┌───────────┐        ┌──────────────────────┐
+                    │ mycelium  │ ─────► │        hyphad        │ ◄── your CLI
+                    │  (panel)  │  /api  │  api · agent · audit │
+                    └───────────┘        └──────────┬───────────┘
+                                      outbound ws  │
+                                ┌──────────────────┼──────────────────┐
+                             ┌──▼───┐           ┌──▼───┐           ┌──▼───┐
+                             │ sat  │           │ sat  │           │ sat  │
+                             └──────┘           └──────┘           └──────┘
 ```
 
 ## Why not ssh
@@ -43,7 +43,7 @@ cargo build --release
 scripts/build.sh
 ```
 
-### 2. run the hub (on the box that will hold the panel)
+### 2. run the hub
 
 ```sh
 sudo mkdir -p /var/lib/hypha
@@ -51,20 +51,15 @@ sudo ./target/release/hyphad --listen 0.0.0.0:5522 --public-url https://hub.exam
 ```
 
 **There is no login.** The hub assumes it is reachable only from a private
-network (Tailscale, WireGuard, loopback). Anybody who can reach port 5522 can
-run commands as root on every enrolled host — so don't expose it to the
-internet. If you need a public hub, put an auth proxy in front of it.
+network (Tailscale, WireGuard, loopback). Anybody who can reach it can run
+commands as root on every enrolled host — so don't expose it to the internet. If
+you need a public hub, put an auth proxy in front of it.
 
-For a public hub, put TLS in front of it. Caddy is one line (`dist/Caddyfile`):
-
-```
-hub.example.com {
-    reverse_proxy 127.0.0.1:5522
-}
-```
-
-`hyphad` itself speaks plain HTTP on purpose — a reverse proxy gives you certs,
-HSTS, and access logs for free.
+`hyphad` speaks plain HTTP on purpose and ships **no UI**. Run it on loopback,
+put a reverse proxy in front of it for TLS, and serve the panel from
+[mycelium](https://github.com/JoeWest9966/mycelium). See
+`dist/nginx-hypha.conf` for the full route map, or `mycelium/deploy/proxy.mjs`
+if you have no web server.
 
 ### 3. add a server
 
@@ -136,12 +131,14 @@ The agent never listens on a port and never talks to anything except the hub.
 - **Keep an out-of-band way in** (ssh, cloud console). A tool that becomes your
   only door and then breaks is worse than ssh.
 
-## Panel and API are separate projects
+## The panel lives in another repository
 
-The panel is being extracted into its own repository (**mycelium**), because it
-needs a real build step (React + TypeScript) and it ships on its own schedule.
-The hub is API-only from here on, and `api/openapi.yaml` is the contract between
-them.
+This repository is the backend: API, agent rendezvous, installer channel, SQLite,
+audit. There is no frontend code here, and that is deliberate.
+
+The panel is [**mycelium**](https://github.com/JoeWest9966/mycelium) — React +
+TypeScript, generated from the contract in `api/openapi.yaml`. It can be
+deployed anywhere that can reach the API, and it ships on its own schedule.
 
 Three things make that split safe rather than merely tidy:
 
@@ -181,8 +178,9 @@ fork `mycelium` and want the single-binary story back, point `static_dir` at its
 ```sh
 scripts/check-api-contract.sh # router ↔ api/openapi.yaml, fails on drift
 scripts/smoke.sh              # hub + local satellite: enroll, exec, exit codes, pty, audit
-cd panel-test && npm i && npm test   # legacy panel driven in jsdom (deleted once mycelium lands)
 ```
+
+The panel's own tests live in the mycelium repository.
 
 ## Status
 
@@ -195,15 +193,15 @@ agents.
 
 ```
 crates/proto   wire protocol (one file, read this first)
-crates/hub     hyphad  — panel, api, agent rendezvous, sqlite
+crates/hub     hyphad  — api, agent rendezvous, installer channel, sqlite
 crates/agent   hypha-sat — the satellite
 crates/cli     hypha   — the cli
-dist/          install.sh, units, proxy config
-scripts/       build.sh (static musl), smoke.sh
-panel-test/    headless panel test (jsdom)
 api/           openapi.yaml — the contract the panel is built against
-crates/hub/static  legacy panel (vanilla js); mycelium replaces it
+dist/          install.sh, units, nginx config
+scripts/       build.sh (static musl), smoke.sh, check-api-contract.sh
 ```
+
+No frontend. The panel is [mycelium](https://github.com/JoeWest9966/mycelium).
 
 ## License
 

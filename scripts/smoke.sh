@@ -28,7 +28,7 @@ cat > "$TMP/hub.json" <<EOF
   "public_url": "${HUB}",
   "data_dir": "${TMP}/data",
   "bin_dir": "${TMP}/bin",
-  "static_dir": "$(pwd)/crates/hub/static"
+  "static_dir": ""
 }
 EOF
 mkdir -p "$TMP/bin"
