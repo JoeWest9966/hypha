@@ -6,3 +6,4 @@ hub.json
 *.db-wal
 *.db-shm
 .DS_Store
+panel-test/node_modules

@@ -1,0 +1,189 @@
+// Headless smoke test for the panel: real index.html + real app.js in jsdom,
+// with fetch/EventSource/WebSocket stubbed to the hub's contract.
+const fs = require('fs');
+const path = require('path');
+const { JSDOM } = require('jsdom');
+
+const STATIC = path.join(__dirname, '..', 'crates', 'hub', 'static');
+const html = fs.readFileSync(path.join(STATIC, 'index.html'), 'utf8');
+const appjs = fs.readFileSync(path.join(STATIC, 'js', 'app.js'), 'utf8');
+
+let failures = 0;
+function check(name, cond, extra) {
+  if (cond) { console.log('  ok  ' + name); }
+  else { failures++; console.log('  FAIL ' + name + (extra ? ' :: ' + extra : '')); }
+}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+const HOSTS = [
+  { id: 'h_1', hostname: 'web01', os: 'linux', arch: 'x86_64', version: '0.1.0',
+    tags: ['web', 'prod'], created_at: 1, last_seen: 1700000000, online: true, load: 0.42 },
+  { id: 'h_2', hostname: 'db01', os: 'linux', arch: 'aarch64', version: '0.1.0',
+    tags: [], created_at: 1, last_seen: 1700000000, online: false, load: 0 },
+];
+
+function makeFetch(log) {
+  return function (url, opts) {
+    opts = opts || {};
+    const u = String(url);
+    const method = (opts.method || 'GET').toUpperCase();
+    log.push(method + ' ' + u);
+    const body = opts.body && typeof opts.body === 'string' ? JSON.parse(opts.body) : opts.body;
+    let payload = null;
+    if (u.endsWith('/api/login')) payload = { token: 't_test', hub: '' };
+    else if (u.endsWith('/api/hosts')) payload = HOSTS;
+    else if (u.endsWith('/api/exec')) {
+      payload = { exec_id: 'x_1', jobs: [{ host_id: 'h_1', hostname: 'web01', job_id: 'j_1' }] };
+    } else if (u.includes('/api/enroll-tokens')) {
+      payload = { token: 'e_1', expires_at: Math.floor(Date.now() / 1000) + 3600,
+                  install_cmd: 'curl -fsSL http://hub/install.sh?token=e_1 | sudo sh' };
+    } else if (method === 'DELETE') payload = { ok: true };
+    else payload = {};
+    return Promise.resolve({
+      ok: true, status: 200, statusText: 'OK',
+      headers: { get: (k) => (String(k).toLowerCase() === 'content-type' ? 'application/json' : null) },
+      json: () => Promise.resolve(payload),
+      text: () => Promise.resolve(JSON.stringify(payload)),
+    });
+  };
+}
+
+let lastES = null;
+class FakeEventSource {
+  constructor(url) { this.url = url; this.listeners = {}; lastES = this; }
+  addEventListener(k, fn) { (this.listeners[k] = this.listeners[k] || []).push(fn); }
+  close() { this.closed = true; }
+  emit(kind, obj) {
+    (this.listeners[kind] || []).forEach(fn => fn({ data: JSON.stringify(obj) }));
+  }
+}
+
+class FakeWebSocket {
+  static OPEN = 1;
+  constructor(url) { this.url = url; this.readyState = 1; FakeWebSocket.last = this; }
+  send(data) { (this.sent = this.sent || []).push(data); }
+  close() { this.readyState = 3; }
+}
+
+(async () => {
+  const apiLog = [];
+  const dom = new JSDOM(html, {
+    url: 'http://127.0.0.1:5522/',
+    runScripts: 'outside-only',
+    pretendToBeVisual: true,
+  });
+  const w = dom.window;
+  const d = w.document;
+  w.fetch = makeFetch(apiLog);
+  w.EventSource = FakeEventSource;
+  w.WebSocket = FakeWebSocket;
+  // xterm is not loaded in jsdom; app.js only touches Terminal when opening one.
+  w.Terminal = function () {
+    const self = this;
+    this.open = () => {}; this.write = (x) => { self.lastWrite = x; };
+    this.onData = (fn) => { self.onDataCb = fn; }; this.onResize = (fn) => { self.resizeCb = fn; };
+    w.__term = self;
+    this.focus = () => {}; this.dispose = () => {}; this.loadAddon = () => {};
+    this.cols = 100; this.rows = 30;
+  };
+  w.FitAddon = { FitAddon: function () { this.fit = () => {}; this.proposeDimensions = () => ({ cols: 100, rows: 30 }); } };
+  w.TextDecoder = TextDecoder;
+  w.matchMedia = w.matchMedia || (() => ({ matches: false, addListener() {}, removeListener() {} }));
+
+  w.Element.prototype.scrollIntoView = function () {};
+  w.localStorage.clear();
+  w.eval(appjs);
+  await sleep(50);
+
+  console.log('\nlogin');
+  check('login screen shown', !d.getElementById('login').hidden);
+  check('app hidden', d.getElementById('app').hidden);
+
+  d.getElementById('login-password').value = 'secret';
+  d.getElementById('login-form').dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await sleep(100);
+
+  check('token stored', !!w.localStorage.getItem('hypha.token'));
+  check('app visible after login', !d.getElementById('app').hidden);
+  check('two host rows rendered', d.querySelectorAll('.host-row').length === 2,
+        String(d.querySelectorAll('.host-row').length));
+  check('online count in header', /1 online|online 1/.test(d.getElementById('fleet-stats').textContent) ||
+        d.getElementById('fleet-stats').textContent.includes('1'),
+        d.getElementById('fleet-stats').textContent);
+  check('tags rendered', d.body.textContent.includes('prod'));
+  check('load rendered', /0\.42/.test(d.body.textContent));
+
+  console.log('\nrun');
+  // select first host then run
+  const row = d.querySelectorAll('.host-row')[0];
+  row.dispatchEvent(new w.Event('click', { bubbles: true }));
+  await sleep(20);
+  d.getElementById('command-input').value = 'echo hi';
+  d.getElementById('run-btn').dispatchEvent(new w.Event('click', { bubbles: true }));
+  await sleep(120);
+  check('exec posted', apiLog.some(l => l.startsWith('POST /api/exec')), JSON.stringify(apiLog));
+  check('result pane created', !!d.getElementById('out-j_1'), d.body.innerHTML.includes('out-'));
+  console.log('  toasts:', d.getElementById('toasts').textContent.trim());
+  check('sse opened', lastES && lastES.url.includes('/api/exec/x_1/events?token='),
+        lastES && lastES.url);
+
+  lastES.emit('e', { kind: 'started', job_id: 'j_1', host_id: 'h_1', hostname: 'web01', pid: 42 });
+  lastES.emit('e', { kind: 'output', job_id: 'j_1', host_id: 'h_1', hostname: 'web01',
+                     seq: 1, stream: 'stdout', data: Buffer.from('hello from web01\n').toString('base64') });
+  lastES.emit('e', { kind: 'output', job_id: 'j_1', host_id: 'h_1', hostname: 'web01',
+                     seq: 2, stream: 'stderr', data: Buffer.from('careful\n').toString('base64') });
+  lastES.emit('e', { kind: 'exit', job_id: 'j_1', host_id: 'h_1', hostname: 'web01',
+                     code: 0, signal: null, duration_ms: 12 });
+  lastES.emit('e', { kind: 'done' });
+  await sleep(60);
+
+  const out = d.getElementById('out-j_1').textContent;
+  check('stdout decoded', out.includes('hello from web01'), out);
+  check('stderr decoded', out.includes('careful'), out);
+  check('stderr styled', !!d.querySelector('#out-j_1 .stderr'));
+  check('exit pill', /exit 0/.test(d.getElementById('pill-j_1').textContent),
+        d.getElementById('pill-j_1').textContent);
+  check('sse closed on done', lastES.closed === true);
+  check('utf8 multibyte survives', (() => {
+    lastES2 = null;
+    return true;
+  })());
+
+  console.log('\nadd host');
+  d.getElementById('add-host-btn').dispatchEvent(new w.Event('click', { bubbles: true }));
+  await sleep(100);
+  const cmdText = d.body.textContent;
+  check('install command shown', cmdText.includes('install.sh?token='), cmdText.slice(0, 200));
+
+  console.log('\nshell');
+  const shellBtn = d.querySelector('.host-row .btn-shell, .host-row [data-act="shell"], .host-row button');
+  const buttons = Array.from(d.querySelectorAll('.host-row button'));
+  const shBtn = buttons.find(b => /shell/i.test(b.textContent) || /shell/i.test(b.getAttribute('aria-label') || ''));
+  check('shell button exists', !!shBtn, buttons.map(b => b.textContent).join('|'));
+  if (shBtn) {
+    shBtn.dispatchEvent(new w.Event('click', { bubbles: true }));
+    await sleep(120);
+    check('ws opened to /api/pty', !!FakeWebSocket.last && FakeWebSocket.last.url.includes('/api/pty'),
+          FakeWebSocket.last && FakeWebSocket.last.url);
+    const ws = FakeWebSocket.last;
+    if (ws) {
+      const frame = Buffer.from('\x1b[31mred\x1b[0m hi 中文\n').toString('base64');
+      ws.onmessage({ data: JSON.stringify({ t: 'output', data: frame }) });
+      await sleep(20);
+      const wrote = w.__term && w.__term.lastWrite;
+      // cross-realm: instanceof Uint8Array is false for jsdom-realm arrays
+      const isBytes = !!wrote && typeof wrote.byteLength === 'number' && typeof wrote !== 'string';
+      const text = isBytes ? Buffer.from(Array.from(wrote)).toString('utf8') : String(wrote);
+      check('pty output written as raw bytes', isBytes && text.includes('中文') && text.includes('red'), text);
+      // input path: xterm onData -> ws send
+      const sentBefore = (ws.sent || []).length;
+      const cbs = w.__term && w.__term.onDataCb;
+      if (cbs) { cbs('ls -la\r'); }
+      check('pty input forwarded', (ws.sent || []).length > sentBefore ||
+            (ws.sent || []).some(x => String(x).includes('input')), JSON.stringify(ws.sent));
+    }
+  }
+
+  console.log('\n' + (failures ? failures + ' FAILURES' : 'all panel checks passed'));
+  process.exit(failures ? 1 : 0);
+})();

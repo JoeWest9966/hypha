@@ -117,6 +117,13 @@ The agent never listens on a port and never talks to anything except the hub.
 - **Keep an out-of-band way in** (ssh, cloud console). A tool that becomes your
   only door and then breaks is worse than ssh.
 
+## Tests
+
+```sh
+scripts/smoke.sh              # hub + local satellite: enroll, exec, exit codes, pty, audit
+cd panel-test && npm i && npm test   # panel driven in jsdom against the real api contract
+```
+
 ## Status
 
 Early. Working today: enroll, fleet list, fan-out exec with live output, browser
@@ -132,6 +139,8 @@ crates/hub     hyphad  — panel, api, agent rendezvous, sqlite
 crates/agent   hypha-sat — the satellite
 crates/cli     hypha   — the cli
 dist/          install.sh, units, proxy config
+scripts/       build.sh (static musl), smoke.sh
+panel-test/    headless panel test (jsdom)
 crates/hub/static  the panel (vanilla js + xterm.js, no build step)
 ```
 
