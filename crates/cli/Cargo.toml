@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 hypha-proto = { path = "../proto" }
+base64 = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 crossterm = { workspace = true }

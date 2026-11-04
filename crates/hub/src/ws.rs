@@ -109,6 +109,7 @@ async fn handle(st: Arc<AppState>, socket: WebSocket) {
     // --- live loop -----------------------------------------------------------
     let (tx, mut rx) = mpsc::unbounded_channel::<HubMsg>();
     let handle = Arc::new(AgentHandle {
+        metrics: Default::default(),
         tx,
         hostname: hostname.clone(),
         load: Arc::new(AtomicU32::new(0f32.to_bits())),
@@ -186,8 +187,27 @@ async fn on_agent_msg(
 ) -> bool {
     match msg {
         AgentMsg::Pong => true,
-        AgentMsg::Stat { load, .. } => {
+        AgentMsg::Stat {
+            load,
+            procs,
+            cpu_pct,
+            mem_used,
+            mem_total,
+            disk_used,
+            disk_total,
+            uptime_sec,
+        } => {
             agent.set_load(load);
+            agent.set_metrics(HostMetrics {
+                cpu_pct,
+                mem_used,
+                mem_total,
+                disk_used,
+                disk_total,
+                procs,
+                uptime_sec,
+                collected_at: hypha_proto::now(),
+            });
             true
         }
         AgentMsg::ExecStarted { exec, pid } => {
@@ -250,18 +270,42 @@ async fn on_agent_msg(
             true
         }
         AgentMsg::PtyChunk { pty, data, .. } => {
-            if let Some(tx) = st.ptys.read().await.get(&pty).map(|p| p.tx.clone()) {
-                let _ = tx.send(AgentMsg::PtyChunk {
-                    pty,
-                    seq: 0,
-                    data,
-                });
+            // Always into the scrollback, whether or not a client is attached:
+            // that buffer is what makes reattach continuous.
+            if let Some(session) = st.ptys.read().await.get(&pty).cloned() {
+                if let Some(bytes) = b64_decode(&data) {
+                    session.push_bytes(&bytes).await;
+                }
+                let sink = session.sink.lock().await.clone();
+                if let Some(tx) = sink {
+                    let _ = tx.send(TermOut::Output { data });
+                }
             }
             true
         }
         AgentMsg::PtyExit { pty, code } => {
-            if let Some(tx) = st.ptys.read().await.get(&pty).map(|p| p.tx.clone()) {
-                let _ = tx.send(AgentMsg::PtyExit { pty, code });
+            if let Some(session) = st.ptys.read().await.get(&pty).cloned() {
+                session.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+                let sink = session.sink.lock().await.clone();
+                if let Some(tx) = sink {
+                    let _ = tx.send(TermOut::Exit { code });
+                }
+            }
+            true
+        }
+        AgentMsg::FileResult {
+            id,
+            ok,
+            bytes,
+            error,
+        } => {
+            if let Some(tx) = st.waiters.write().await.remove(&id) {
+                let _ = tx.send(AgentMsg::FileResult {
+                    id,
+                    ok,
+                    bytes,
+                    error,
+                });
             }
             true
         }
@@ -322,5 +366,21 @@ async fn fail_orphans(st: &Arc<AppState>, host_id: &str) {
         }
     }
 
-    st.ptys.write().await.retain(|_, p| p.host_id != host_id);
+    // Shells on a dead host cannot be reattached, so drop them outright.
+    let orphans: Vec<Arc<crate::state::PtySession>> = st
+        .ptys
+        .read()
+        .await
+        .values()
+        .filter(|p| p.host_id == host_id)
+        .cloned()
+        .collect();
+    for p in orphans {
+        st.ptys.write().await.remove(&p.id);
+    }
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
 }

@@ -96,10 +96,34 @@ pub enum AgentMsg {
         pty: String,
         code: Option<i32>,
     },
-    /// Periodic housekeeping from the agent: load, active sessions.
+    /// Periodic housekeeping from the agent.
+    ///
+    /// Everything past `procs` is `#[serde(default)]` so a hub and an agent of
+    /// different vintages still talk: an old agent sends `{load, procs}` and the
+    /// new fields read as zero, which is exactly what "no data" looks like.
     Stat {
         load: f32,
         procs: u32,
+        #[serde(default)]
+        cpu_pct: f32,
+        #[serde(default)]
+        mem_used: u64,
+        #[serde(default)]
+        mem_total: u64,
+        #[serde(default)]
+        disk_used: u64,
+        #[serde(default)]
+        disk_total: u64,
+        #[serde(default)]
+        uptime_sec: u64,
+    },
+    /// Answer to `FileWrite`. `error` is present only when `ok` is false.
+    FileResult {
+        id: String,
+        ok: bool,
+        bytes: u64,
+        #[serde(default)]
+        error: Option<String>,
     },
     Pong,
     Error {
@@ -151,9 +175,35 @@ pub enum HubMsg {
     PtyClose {
         id: String,
     },
+    /// Write `data` (base64) to `path`, atomically: the agent writes a temp
+    /// file next to the target and renames it, so a full disk or a killed agent
+    /// never leaves a half-written file where the old one used to be.
+    FileWrite {
+        id: String,
+        path: String,
+        /// Unix mode, decimal. `0` means "use 0644".
+        mode: u32,
+        /// base64
+        data: String,
+    },
     Ping,
     /// Ask the agent to drop the socket (hub shutting down / agent revoked).
     Shutdown,
+}
+
+/// Latest resource report from an agent. Serialized straight into the host
+/// list, so this shape is the API's shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostMetrics {
+    /// Busy fraction over the last reporting interval, 0-100.
+    pub cpu_pct: f32,
+    pub mem_used: u64,
+    pub mem_total: u64,
+    pub disk_used: u64,
+    pub disk_total: u64,
+    pub procs: u32,
+    pub uptime_sec: u64,
+    pub collected_at: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +245,10 @@ pub struct Host {
     pub online: bool,
     #[serde(default)]
     pub load: f32,
+    /// Absent until the agent's first report, and absent again for any host
+    /// that is offline: metrics are live state, never history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<HostMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,4 +400,54 @@ pub const API_VERSION: u32 = 1;
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+// ---------------------------------------------------------------------------
+// files / pty sessions (API surface)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilePushRequest {
+    pub targets: Targets,
+    pub path: String,
+    /// Decimal unix mode; 0 or absent means 0644.
+    #[serde(default)]
+    pub mode: Option<u32>,
+    /// base64 of the file bytes.
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilePushResponse {
+    pub results: Vec<FilePushResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilePushResult {
+    pub host_id: String,
+    pub hostname: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyOpenRequest {
+    pub host_id: String,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtySession {
+    pub pty_id: String,
+    pub host_id: String,
+    pub hostname: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub attached: bool,
 }

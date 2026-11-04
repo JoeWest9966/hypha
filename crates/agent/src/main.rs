@@ -7,7 +7,9 @@
 //!  * Ptys outlive the client. Reattaching is just a new relay through the hub.
 
 mod exec;
+mod files;
 mod term;
+mod sysstat;
 mod tls;
 
 use anyhow::{bail, Context, Result};
@@ -292,13 +294,28 @@ async fn session(cfg: &AgentConfig, key: Arc<ed25519_dalek::SigningKey>) -> Resu
         let tx = out_tx.clone();
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_secs(30));
+            // cpu_pct is a delta and needs the previous jiffies kept across ticks.
+            let mut prev_cpu = None;
             loop {
                 iv.tick().await;
                 let load = std::fs::read_to_string("/proc/loadavg")
                     .ok()
                     .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse::<f32>().ok()))
                     .unwrap_or(0.0);
-                if tx.send(AgentMsg::Stat { load, procs: 0 }).is_err() {
+                let m = crate::sysstat::collect_with(&mut prev_cpu);
+                if tx
+                    .send(AgentMsg::Stat {
+                        load,
+                        procs: m.procs,
+                        cpu_pct: m.cpu_pct,
+                        mem_used: m.mem_used,
+                        mem_total: m.mem_total,
+                        disk_used: m.disk_used,
+                        disk_total: m.disk_total,
+                        uptime_sec: m.uptime_sec,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -330,6 +347,33 @@ async fn session(cfg: &AgentConfig, key: Arc<ed25519_dalek::SigningKey>) -> Resu
             }
             HubMsg::ExecSignal { id, signal } => {
                 exec::signal(&ctx, &id, signal);
+            }
+            HubMsg::FileWrite {
+                id,
+                path,
+                mode,
+                data,
+            } => {
+                use base64::Engine;
+                let res = base64::engine::general_purpose::STANDARD
+                    .decode(&data)
+                    .map_err(|e| anyhow::anyhow!("base64: {e}"))
+                    .and_then(|bytes| files::write(&path, mode, &bytes));
+                let msg = match res {
+                    Ok(bytes) => AgentMsg::FileResult {
+                        id,
+                        ok: true,
+                        bytes,
+                        error: None,
+                    },
+                    Err(e) => AgentMsg::FileResult {
+                        id,
+                        ok: false,
+                        bytes: 0,
+                        error: Some(format!("{e:#}")),
+                    },
+                };
+                let _ = ctx.out.send(msg);
             }
             HubMsg::PtyOpen {
                 id,

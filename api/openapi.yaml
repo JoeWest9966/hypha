@@ -39,6 +39,10 @@ tags:
     description: Command execution and its output stream.
   - name: pty
     description: Interactive shells.
+  - name: audit
+    description: Append-only record of what the hub did.
+  - name: files
+    description: Push a file to selected hosts.
   - name: bootstrap
     description: Agent installation endpoints (not part of the panel API).
 
@@ -272,6 +276,36 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiError'
 
+  /api/exec/{id}/cancel:
+    post:
+      tags: [exec]
+      summary: Kill a running command
+      description: |
+        Sends SIGTERM to the whole process group on every host that is still
+        running this exec, then SIGKILL 5 seconds later if it has not exited.
+        Hosts that already finished are reported as not cancelled, not as an
+        error — cancelling a finished run is a no-op, not a failure.
+      operationId: cancelExec
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Which hosts were signalled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecCancelResponse'
+        '404':
+          description: Unknown exec id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
   /api/execs:
     get:
       tags: [exec]
@@ -288,24 +322,160 @@ paths:
                 items:
                   $ref: '#/components/schemas/ExecRecord'
 
+  /api/files:
+    post:
+      tags: [files]
+      summary: Write a file on selected hosts
+      description: |
+        Contents are base64 in the request and are written atomically on the
+        agent (temp file in the same directory, then rename), so a truncated
+        upload can never leave a half-written file in place.
+
+        The call blocks until every online agent acknowledges or the deadline
+        passes; offline hosts come back with `ok: false` and `error: offline`
+        rather than being silently skipped.
+      operationId: pushFiles
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FilePushRequest'
+      responses:
+        '200':
+          description: Per-host results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FilePushResponse'
+        '400':
+          description: Empty path, bad base64, or no host matched
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /api/audit:
+    get:
+      tags: [audit]
+      summary: Audit trail
+      description: |
+        Newest first. Every state change the hub performs lands here:
+        `host.enroll`, `host.tags`, `host.delete`, `enroll.token.revoke`,
+        `exec`, `file.push`, `pty.open`.
+
+        This is the only place that answers "who ran what on which machine last
+        week", so it is stored in SQLite and never pruned by the hub.
+      operationId: listAudit
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Optional; defaults to 100, capped at 1000.
+          schema:
+            type: integer
+            minimum: 1
+        - name: action
+          in: query
+          required: false
+          description: Optional exact match, e.g. `exec`.
+          schema:
+            type: string
+        - name: host
+          in: query
+          required: false
+          description: Optional exact match on the host id or hostname.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Audit entries, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuditEntry'
+
   /api/pty:
+    post:
+      tags: [pty]
+      summary: Open a shell session
+      description: |
+        Allocates a pty session and asks the agent to spawn the shell, then
+        returns at once with the session id. Attach with `GET /api/pty?pty_id=`.
+        Splitting create from attach is what makes a shell survivable: a dropped
+        WebSocket (tab reload, laptop lid, flaky wifi) detaches the client but
+        leaves the session running on the agent, so reattaching replays the
+        scrollback and carries on in the same shell.
+
+        Sessions are reaped `pty_ttl_sec` (default 600) after the last detach.
+      operationId: openPty
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PtyOpenRequest'
+      responses:
+        '200':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PtySession'
+        '400':
+          description: Missing host_id, or the host is not connected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
     get:
       tags: [pty]
       summary: Interactive shell (WebSocket)
       description: |
         WebSocket upgrade. Frames are JSON in both directions.
 
-        Client → hub is `TermIn`. Hub → client is `TermOut`. Note the asymmetry:
-        `TermIn.input.data` is a plain UTF-8 string (what the human typed), while
-        `TermOut.output.data` is base64 of raw terminal bytes (which are not
-        valid UTF-8 in general). Getting that backwards produces a garbled or
-        empty terminal.
+        Attach with `pty_id` (created by `POST /api/pty`) or with `host_id`,
+        which creates a throwaway session and attaches in one step — that is the
+        legacy shape and still works, it just cannot survive a disconnect.
+
+        Note the encoding asymmetry: `TermIn.input.data` is a plain UTF-8 string
+        (what the human typed), while `TermOut.output.data` is base64 of raw
+        terminal bytes (which are not valid UTF-8 in general). Getting that
+        backwards produces a garbled or empty terminal.
 
         The hub closes the socket with a normal close frame when the shell
         exits; `TermOut.exit` carries the code.
       operationId: pty
       x-websocket: true
       parameters:
+        - name: pty_id
+          in: query
+          required: false
+          description: Attach to an existing session. Mutually exclusive with `host_id`.
+          schema:
+            type: string
+        - name: host_id
+          in: query
+          required: false
+          description: Create a transient session and attach. Required when `pty_id` is absent.
+          schema:
+            type: string
+        - name: cols
+          in: query
+          required: false
+          description: Optional, defaults to 80. Ignored when attaching.
+          schema:
+            type: integer
+            minimum: 1
+        - name: rows
+          in: query
+          required: false
+          description: Optional, defaults to 24. Ignored when attaching.
+          schema:
+            type: integer
+            minimum: 1
         - name: host_id
           in: query
           required: true
@@ -537,6 +707,12 @@ components:
           type: number
           format: float
           description: 'Agent-reported load average; 0 when offline.'
+        metrics:
+          allOf:
+            - $ref: '#/components/schemas/HostMetrics'
+          description: |
+            Latest agent report; absent when the host has never reported, which
+            includes every host that is offline.
 
     EnrollRequest:
       type: object
@@ -738,6 +914,160 @@ components:
         created_at:
           type: integer
           format: int64
+        live:
+          type: boolean
+          description: |
+            True while the hub still holds this run in memory. A finished run
+            with `live: false` is still replayable from SQLite — that is the
+            whole point of keeping it.
+
+    AuditEntry:
+      type: object
+      required: [id, ts, actor, action, host, detail]
+      properties:
+        id:
+          type: integer
+          format: int64
+        ts:
+          type: integer
+          format: int64
+          description: Unix seconds.
+        actor:
+          type: string
+          description: 'Always `admin`: the hub has no identities, the network is the boundary.'
+        action:
+          type: string
+          description: '`host.enroll` / `host.tags` / `host.delete` / `enroll.token.revoke` / `exec` / `file.push` / `pty.open`.'
+        host:
+          type: string
+          description: Host id or hostname; empty when the action is fleet-wide.
+        detail:
+          type: string
+          description: Human-readable specifics (the command, the tag list, the token label).
+
+    ExecCancelResponse:
+      type: object
+      required: [cancelled]
+      properties:
+        cancelled:
+          type: array
+          items:
+            type: string
+          description: Host ids that were still running and got signalled.
+
+    FilePushRequest:
+      type: object
+      required: [targets, path, content]
+      properties:
+        targets:
+          $ref: '#/components/schemas/Targets'
+        path:
+          type: string
+          description: Absolute path on the agent.
+        mode:
+          type: integer
+          description: Optional unix mode, defaults to 0644 (given in decimal).
+        content:
+          type: string
+          description: base64 of the file bytes.
+      description: |
+        There is no size limit in the contract and none in the hub, but the
+        file travels as one JSON frame over the agent socket, so anything past a
+        few megabytes is a bad idea and will be slow.
+
+    FilePushResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/FilePushResult'
+
+    FilePushResult:
+      type: object
+      required: [host_id, hostname, ok]
+      properties:
+        host_id:
+          type: string
+        hostname:
+          type: string
+        ok:
+          type: boolean
+        bytes:
+          type: integer
+          description: Bytes written; 0 on failure.
+        error:
+          type: string
+          description: Present when `ok` is false.
+
+    HostMetrics:
+      type: object
+      properties:
+        cpu_pct:
+          type: number
+          format: float
+          description: Busy fraction over the last report interval, 0-100.
+        mem_used:
+          type: integer
+          format: int64
+          description: Bytes.
+        mem_total:
+          type: integer
+          format: int64
+          description: Bytes.
+        disk_used:
+          type: integer
+          format: int64
+          description: Bytes used on `/`.
+        disk_total:
+          type: integer
+          format: int64
+          description: Bytes total on `/`.
+        procs:
+          type: integer
+          description: Runnable process count.
+        uptime_sec:
+          type: integer
+          format: int64
+        collected_at:
+          type: integer
+          format: int64
+          description: Unix seconds.
+      description: |
+        Best-effort, Linux-only. Fields the agent could not read are 0 rather
+        than absent, so a dashboard can render without null checks.
+
+    PtyOpenRequest:
+      type: object
+      required: [host_id]
+      properties:
+        host_id:
+          type: string
+        cols:
+          type: integer
+          description: Optional, defaults to 80.
+        rows:
+          type: integer
+          description: Optional, defaults to 24.
+
+    PtySession:
+      type: object
+      required: [pty_id, host_id, hostname, cols, rows, attached]
+      properties:
+        pty_id:
+          type: string
+        host_id:
+          type: string
+        hostname:
+          type: string
+        cols:
+          type: integer
+        rows:
+          type: integer
+        attached:
+          type: boolean
+          description: True while a WebSocket client is connected.
 
     ExecEvent:
       oneOf:

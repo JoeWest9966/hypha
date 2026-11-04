@@ -55,6 +55,44 @@ enum Cmd {
     Rm { host: String },
     /// Recent commands.
     History,
+    /// Cancel a running command by exec id.
+    Cancel { exec: String },
+    /// Audit trail: who did what, newest first.
+    Audit {
+        #[arg(long)]
+        action: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Copy a local file to hosts.
+    Cp {
+        file: String,
+        path: String,
+        #[arg(long, default_value = "0644")]
+        mode: String,
+        #[arg(short = 't', long = "tag")]
+        tags: Vec<String>,
+        /// Hosts (name or id). Empty = every host.
+        hosts: Vec<String>,
+    },
+    /// Install hypha on a machine over ssh, from this machine.
+    ///
+    /// The credentials never leave your box: this builds an install command and
+    /// runs it through your own ssh, so the hub stays a hub and not a vault.
+    Push {
+        /// ssh target: `root@10.0.0.5`, `host:2222`, or a ~/.ssh/config alias.
+        target: String,
+        /// Hostname to record (defaults to what the agent reports).
+        #[arg(short = 'n', long)]
+        name: Option<String>,
+        #[arg(short = 't', long = "tag")]
+        tags: Vec<String>,
+        /// Print the ssh command instead of running it.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -207,7 +245,262 @@ async fn main() -> Result<()> {
         Cmd::Sh { host } => shell(&args, &cfg, &paint, host).await,
         Cmd::Rm { host } => rm(&args, &cfg, &paint, host).await,
         Cmd::History => history(&args, &cfg, &paint).await,
+        Cmd::Cancel { exec } => cancel(&cfg, &paint, &exec).await,
+        Cmd::Audit {
+            action,
+            host,
+            limit,
+        } => audit(&cfg, &paint, action, host, limit).await,
+        Cmd::Cp {
+            file,
+            path,
+            mode,
+            tags,
+            hosts,
+        } => cp(&cfg, &paint, &file, &path, &mode, tags, hosts).await,
+        Cmd::Push {
+            target,
+            name,
+            tags,
+            dry_run,
+        } => push(&cfg, &paint, &target, name, tags, dry_run).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// cancel / audit / cp / push
+// ---------------------------------------------------------------------------
+
+async fn cancel(cfg: &Config, paint: &Paint, exec: &str) -> Result<()> {
+    let url = format!("{}/api/exec/{}/cancel", cfg.hub, urlencoding::encode(exec));
+    let resp = client_with(cfg).post(&url).send().await?;
+    if !resp.status().is_success() {
+        bail!("cancel failed: {}", resp.text().await.unwrap_or_default());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let hosts = v["cancelled"].as_array().cloned().unwrap_or_default();
+    if hosts.is_empty() {
+        eprintln!("{} nothing was running", paint.dim(".."));
+    } else {
+        eprintln!(
+            "{} signalled {} host(s)",
+            paint.green("ok"),
+            hosts.len()
+        );
+    }
+    Ok(())
+}
+
+async fn audit(
+    cfg: &Config,
+    paint: &Paint,
+    action: Option<String>,
+    host: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    let mut url = format!("{}/api/audit?limit={}", cfg.hub, limit);
+    if let Some(a) = action {
+        url.push_str(&format!("&action={}", urlencoding::encode(&a)));
+    }
+    if let Some(h) = host {
+        url.push_str(&format!("&host={}", urlencoding::encode(&h)));
+    }
+    let rows: Vec<serde_json::Value> = client_with(cfg).get(&url).send().await?.json().await?;
+    if rows.is_empty() {
+        eprintln!("{}", paint.dim("no audit entries"));
+        return Ok(());
+    }
+    for r in rows {
+        let ts = r["ts"].as_i64().unwrap_or(0);
+        let when = stamp(ts);
+        let action = r["action"].as_str().unwrap_or("");
+        let host = r["host"].as_str().unwrap_or("");
+        let detail = r["detail"].as_str().unwrap_or("");
+        let detail = if detail.chars().count() > 70 {
+            format!("{}…", detail.chars().take(70).collect::<String>())
+        } else {
+            detail.to_string()
+        };
+        println!(
+            "{}  {:<22} {:<16} {}",
+            paint.dim(&when),
+            paint.cyan(action),
+            host,
+            paint.dim(&detail)
+        );
+    }
+    Ok(())
+}
+
+/// Local-time-ish stamp without pulling a date library: UTC is honest here.
+fn stamp(ts: i64) -> String {
+    let secs = ts.max(0) as u64;
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    // Civil-from-days (Howard Hinnant's algorithm), so this does not need chrono.
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+async fn cp(
+    cfg: &Config,
+    paint: &Paint,
+    file: &str,
+    path: &str,
+    mode: &str,
+    tags: Vec<String>,
+    hosts: Vec<String>,
+) -> Result<()> {
+    use base64::Engine;
+    let bytes = std::fs::read(file).with_context(|| format!("read {file}"))?;
+    let mode = u32::from_str_radix(mode.trim_start_matches("0o"), 8)
+        .with_context(|| format!("bad mode {mode}"))?;
+    let body = serde_json::json!({
+        "targets": { "hosts": hosts, "tags": tags, "all": hosts_empty(&hosts, &tags) },
+        "path": path,
+        "mode": mode,
+        "content": base64::engine::general_purpose::STANDARD.encode(&bytes),
+    });
+    let resp = client_with(cfg)
+        .post(format!("{}/api/files", cfg.hub))
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("{}", resp.text().await.unwrap_or_default());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let results = v["results"].as_array().cloned().unwrap_or_default();
+    let mut failed = 0;
+    for r in results {
+        let name = r["hostname"].as_str().unwrap_or("?");
+        if r["ok"].as_bool().unwrap_or(false) {
+            println!(
+                "{} {:<20} {}",
+                paint.green("ok"),
+                name,
+                paint.dim(&format!("{} bytes", r["bytes"]))
+            );
+        } else {
+            failed += 1;
+            println!(
+                "{} {:<20} {}",
+                paint.red("xx"),
+                name,
+                r["error"].as_str().unwrap_or("failed")
+            );
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} host(s) failed");
+    }
+    Ok(())
+}
+
+fn hosts_empty(hosts: &[String], tags: &[String]) -> bool {
+    hosts.is_empty() && tags.is_empty()
+}
+
+async fn push(
+    cfg: &Config,
+    paint: &Paint,
+    target: &str,
+    name: Option<String>,
+    tags: Vec<String>,
+    dry_run: bool,
+) -> Result<()> {
+    // A one-shot token: if this command leaks through shell history it is worth
+    // exactly one enrollment for 24 hours.
+    let body = serde_json::json!({
+        "reusable": false,
+        "label": name.clone().unwrap_or_else(|| format!("push to {target}")),
+        "tags": tags,
+    });
+    let resp = client_with(cfg)
+        .post(format!("{}/api/enroll-tokens", cfg.hub))
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("{}", resp.text().await.unwrap_or_default());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let cmd = v["install_cmd"]
+        .as_str()
+        .context("hub did not return an install command")?
+        .to_string();
+
+    let ssh_cmd = format!("ssh {} {}", shell_quote(target), shell_quote(&cmd));
+    if dry_run {
+        println!("{ssh_cmd}");
+        return Ok(());
+    }
+
+    eprintln!("{} installing on {target}", paint.dim(".."));
+    let status = std::process::Command::new("ssh")
+        .arg(target)
+        .arg(&cmd)
+        .status()
+        .context("run ssh (is it installed and is the key loaded?)")?;
+    if !status.success() {
+        bail!("ssh exited with {}", status.code().unwrap_or(-1));
+    }
+
+    // Give the satellite a moment to dial back, then name it.
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let hosts = list_hosts_json(cfg).await.unwrap_or_default();
+        if let Some(h) = hosts.iter().find(|h| {
+            h["online"].as_bool().unwrap_or(false)
+                && name
+                    .as_deref()
+                    .map(|n| h["hostname"].as_str() == Some(n))
+                    .unwrap_or(true)
+        }) {
+            println!(
+                "{} {} is online ({})",
+                paint.green("ok"),
+                h["hostname"].as_str().unwrap_or("?"),
+                h["id"].as_str().unwrap_or("?")
+            );
+            return Ok(());
+        }
+    }
+    eprintln!(
+        "{} installed, but no new host showed up yet — check `hypha hosts`",
+        paint.dim("..")
+    );
+    Ok(())
+}
+
+async fn list_hosts_json(cfg: &Config) -> Result<Vec<serde_json::Value>> {
+    let v: Vec<serde_json::Value> = client_with(cfg)
+        .get(format!("{}/api/hosts", cfg.hub))
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(v)
+}
+
+/// Quote for a POSIX shell. Single quotes, with embedded quotes escaped, is the
+/// only form that is safe for arbitrary command text.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 async fn set_hub(args: &Args, url: Option<String>, paint: &Paint) -> Result<()> {

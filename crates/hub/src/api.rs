@@ -31,20 +31,37 @@ type Api<T> = Result<Json<T>, ApiErr>;
 // arbitrary commands as root on every enrolled host.
 // ---------------------------------------------------------------------------
 
+/// Base URL for install commands.
+///
+/// The origin the caller just used wins, because an address that served this
+/// request is by definition one the operator can reach — whether that is a
+/// tailnet IP, a MagicDNS name or a proxy hostname. `public_url` is the
+/// fallback for callers with no Host header (a local script), and it is what
+/// the hub advertises when nothing else is known.
 fn public_base(state: &AppState, headers: &HeaderMap) -> String {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|h| h.to_str().ok())
+        .filter(|h| !h.is_empty())
+        // A loopback origin is reachable from this box and nowhere else. An
+        // install command built from it would be pasted into a remote shell and
+        // fail, so fall through to public_url instead.
+        .filter(|h| {
+            let name = h.rsplit_once(':').map(|(n, _)| n).unwrap_or(h);
+            !(name == "localhost" || name == "[::1]" || name.starts_with("127."))
+        });
+    if let Some(host) = host {
+        let proto = headers
+            .get("x-forwarded-proto")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("http");
+        return format!("{proto}://{host}").trim_end_matches('/').to_string();
+    }
     if !state.cfg.public_url.is_empty() {
         return state.cfg.public_url.trim_end_matches('/').to_string();
     }
-    let host = headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost:5522")
-        .to_string();
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("http");
-    format!("{proto}://{host}")
+    "http://localhost:5522".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +103,7 @@ pub async fn enroll(State(st): State<Arc<AppState>>, Json(req): Json<EnrollReque
         last_seen: now(),
         online: false,
         load: 0.0,
+        metrics: None,
     };
     if let Err(e) = st.db.insert_host(&host, &req.pubkey) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}"));
@@ -110,6 +128,7 @@ pub async fn list_hosts(State(st): State<Arc<AppState>>) -> Api<Vec<Host>> {
         if let Some(a) = agents.get(&h.id) {
             h.online = true;
             h.load = a.load();
+            h.metrics = a.metrics();
         }
     }
     Ok(Json(hosts))
@@ -121,6 +140,22 @@ pub async fn delete_host(
 ) -> Api<serde_json::Value> {
     if let Some(a) = st.agent(&id).await {
         a.send(HubMsg::Shutdown);
+    }
+    // Shells on a host that no longer exists would keep an agent process alive
+    // forever with nobody able to reach it.
+    let doomed: Vec<Arc<crate::state::PtySession>> = st
+        .ptys
+        .read()
+        .await
+        .values()
+        .filter(|p| p.host_id == id)
+        .cloned()
+        .collect();
+    for p in doomed {
+        if let Some(a) = st.agent(&p.host_id).await {
+            a.send(HubMsg::PtyClose { id: p.id.clone() });
+        }
+        st.ptys.write().await.remove(&p.id);
     }
     st.db.delete_host(&id).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: e.to_string() })))?;
     Ok(Json(json!({ "ok": true })))
@@ -217,6 +252,25 @@ pub async fn revoke_enroll_token(
 // exec
 // ---------------------------------------------------------------------------
 
+/// Resolve targets to hosts. Shared by exec and file push so "which machines
+/// does `all` mean" has exactly one answer.
+pub async fn pick_hosts(st: &AppState, t: &Targets) -> Result<Vec<Host>, ApiErr> {
+    let hosts = st.db.list_hosts().unwrap_or_default();
+    let by_all = t.all || (t.hosts.is_empty() && t.tags.is_empty());
+    let picked: Vec<Host> = hosts
+        .into_iter()
+        .filter(|h| {
+            let by_id = t.hosts.iter().any(|x| x == &h.id);
+            let by_tag = !t.tags.is_empty() && h.tags.iter().any(|tag| t.tags.iter().any(|x| x == tag));
+            by_id || by_tag || by_all
+        })
+        .collect();
+    if picked.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "no hosts matched");
+    }
+    Ok(picked)
+}
+
 pub async fn create_exec(
     State(st): State<Arc<AppState>>,
     Json(req): Json<ExecRequest>,
@@ -225,21 +279,8 @@ pub async fn create_exec(
         return err(StatusCode::BAD_REQUEST, "empty command");
     }
 
-    let hosts = st.db.list_hosts().unwrap_or_default();
+    let picked = pick_hosts(&st, &req.targets).await?;
     let online = st.agents.read().await;
-    let mut picked: Vec<Host> = Vec::new();
-    for h in hosts {
-        let by_id = req.targets.hosts.iter().any(|x| x == &h.id);
-        let by_tag = !req.targets.tags.is_empty()
-            && h.tags.iter().any(|t| req.targets.tags.iter().any(|x| x == t));
-        let by_all = req.targets.all || (req.targets.hosts.is_empty() && req.targets.tags.is_empty());
-        if by_id || by_tag || by_all {
-            picked.push(h);
-        }
-    }
-    if picked.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "no hosts matched");
-    }
 
     let exec_id = gen_id("x", 10);
     let timeout = req.timeout_sec.unwrap_or(st.cfg.exec_timeout_sec).min(86400);
@@ -269,7 +310,7 @@ pub async fn create_exec(
     st.db.audit("exec", "", &req.command);
 
     let total = jobs.len() + offline.len();
-    let chan = Arc::new(ExecChannel::new(exec_id.clone(), total));
+    let chan = Arc::new(ExecChannel::new(exec_id.clone(), total, st.db.clone()));
     st.execs.write().await.insert(exec_id.clone(), chan.clone());
 
     for job_id in offline {
@@ -330,10 +371,24 @@ pub async fn create_exec(
 pub async fn exec_events(
     State(st): State<Arc<AppState>>,
     Path(exec_id): Path<String>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>, Response> {
-    let chan = st.execs.read().await.get(&exec_id).cloned().ok_or_else(|| {
-        (StatusCode::NOT_FOUND, Json(ApiError { error: "unknown exec".into() })).into_response()
-    })?;
+) -> Response {
+    let chan = st.execs.read().await.get(&exec_id).cloned();
+
+    // A run that has left memory is still a run that happened. Serve it from
+    // SQLite so history is browsable after a hub restart instead of 404ing.
+    let Some(chan) = chan else {
+        let lines = st.db.load_chunks(&exec_id);
+        if lines.is_empty() {
+            return (StatusCode::NOT_FOUND, Json(ApiError { error: "unknown exec".into() }))
+                .into_response();
+        }
+        let stream = async_stream::stream! {
+            for line in lines {
+                yield Ok::<Event, std::convert::Infallible>(Event::default().event("e").data(line));
+            }
+        };
+        return Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+    };
 
     let stream = async_stream::stream! {
         let mut cursor = 0usize;
@@ -347,7 +402,7 @@ pub async fn exec_events(
                 idle = 0;
                 for line in batch {
                     cursor += 1;
-                    yield Ok(Event::default().event("e").data(line));
+                    yield Ok::<Event, std::convert::Infallible>(Event::default().event("e").data(line));
                 }
                 continue;
             }
@@ -356,33 +411,256 @@ pub async fn exec_events(
             }
             idle += 1;
             if idle % 300 == 0 {
-                yield Ok(Event::default().comment("ka"));
+                yield Ok::<Event, std::convert::Infallible>(Event::default().comment("ka"));
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
     };
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
 }
 
 pub async fn recent_execs(State(st): State<Arc<AppState>>) -> Api<Vec<serde_json::Value>> {
-    Ok(Json(st.db.recent_execs(50)))
+    let live: Vec<String> = st.execs.read().await.keys().cloned().collect();
+    let mut out = st.db.recent_execs(50);
+    for row in out.iter_mut() {
+        let is_live = row
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|id| live.iter().any(|l| l == id))
+            .unwrap_or(false);
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("live".into(), json!(is_live));
+        }
+    }
+    Ok(Json(out))
+}
+
+// ---------------------------------------------------------------------------
+// cancel
+// ---------------------------------------------------------------------------
+
+pub async fn cancel_exec(
+    State(st): State<Arc<AppState>>,
+    Path(exec_id): Path<String>,
+) -> Api<serde_json::Value> {
+    if !st.execs.read().await.contains_key(&exec_id) {
+        return err(StatusCode::NOT_FOUND, "unknown exec");
+    }
+    // Only jobs still in the routing table are running; the rest already
+    // reported an exit and are simply not cancelled.
+    let running: Vec<(String, String)> = {
+        let jobs = st.jobs.read().await;
+        jobs.iter()
+            .filter(|(_, r)| r.exec_id == exec_id)
+            .map(|(job, r)| (job.clone(), r.host_id.clone()))
+            .collect()
+    };
+    let mut cancelled = Vec::new();
+    for (job_id, host_id) in running {
+        if let Some(a) = st.agent(&host_id).await {
+            if a.send(HubMsg::ExecSignal {
+                id: job_id,
+                signal: Signal::Term,
+            }) {
+                cancelled.push(host_id);
+            }
+        }
+    }
+    st.db.audit("exec.cancel", "", &exec_id);
+
+    // Escalate to SIGKILL for anything that ignored SIGTERM. The agent reaps
+    // the whole process group, so a shell script's children die too.
+    let st2 = st.clone();
+    let ids = cancelled.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let jobs = st2.jobs.read().await;
+        for (job_id, host_id) in jobs.iter().map(|(j, r)| (j.clone(), r.host_id.clone())) {
+            if !ids.contains(&host_id) {
+                continue;
+            }
+            if let Some(a) = st2.agent(&host_id).await {
+                a.send(HubMsg::ExecSignal {
+                    id: job_id,
+                    signal: Signal::Kill,
+                });
+            }
+        }
+    });
+
+    Ok(Json(json!({ "cancelled": cancelled })))
+}
+
+// ---------------------------------------------------------------------------
+// files
+// ---------------------------------------------------------------------------
+
+pub async fn push_files(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<FilePushRequest>,
+) -> Api<serde_json::Value> {
+    if req.path.trim().is_empty() || !req.path.starts_with('/') {
+        return err(StatusCode::BAD_REQUEST, "path must be absolute");
+    }
+    let data = match base64_decode(&req.content) {
+        Some(d) => d,
+        None => return err(StatusCode::BAD_REQUEST, "content is not valid base64"),
+    };
+    let picked = match crate::api::pick_hosts(&st, &req.targets).await {
+        Ok(p) => p,
+        Err(e) => return Err(e),
+    };
+    let mode = req.mode.unwrap_or(0o644);
+    let bytes = data.len();
+
+    let mut results = Vec::new();
+    for h in picked {
+        let Some(agent) = st.agent(&h.id).await else {
+            results.push(json!({
+                "host_id": h.id, "hostname": h.hostname, "ok": false, "bytes": 0,
+                "error": "offline",
+            }));
+            continue;
+        };
+        let id = gen_id("f", 10);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        st.waiters.write().await.insert(id.clone(), tx);
+        if !agent.send(HubMsg::FileWrite {
+            id: id.clone(),
+            path: req.path.clone(),
+            mode,
+            data: req.content.clone(),
+        }) {
+            st.waiters.write().await.remove(&id);
+            results.push(json!({
+                "host_id": h.id, "hostname": h.hostname, "ok": false, "bytes": 0,
+                "error": "agent send failed",
+            }));
+            continue;
+        }
+        let label = (h.id.clone(), h.hostname.clone());
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(AgentMsg::FileResult { ok, bytes, error, .. })) => {
+                results.push(json!({
+                    "host_id": label.0, "hostname": label.1, "ok": ok,
+                    "bytes": bytes, "error": error,
+                }));
+            }
+            _ => {
+                st.waiters.write().await.remove(&id);
+                results.push(json!({
+                    "host_id": label.0, "hostname": label.1, "ok": false, "bytes": 0,
+                    "error": "timeout",
+                }));
+            }
+        }
+    }
+    st.db
+        .audit("file.push", "", &format!("{} ({}B, {} hosts)", req.path, bytes, results.len()));
+    Ok(Json(json!({ "results": results })))
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
+// ---------------------------------------------------------------------------
+// audit
+// ---------------------------------------------------------------------------
+
+pub async fn list_audit(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Api<Vec<serde_json::Value>> {
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(100)
+        .clamp(1, 1000);
+    let action = q.get("action").cloned().unwrap_or_default();
+    let host = q.get("host").cloned().unwrap_or_default();
+    Ok(Json(st.db.list_audit(limit, &action, &host)))
 }
 
 // ---------------------------------------------------------------------------
 // pty
 // ---------------------------------------------------------------------------
 
+/// Allocate a session and ask the agent for a shell. Returns before the shell
+/// is ready: the agent's `PtyChunk`s land in the session's scrollback, so an
+/// attach that happens a moment later still sees the prompt.
+pub async fn open_pty(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<PtyOpenRequest>,
+) -> Api<PtySession> {
+    let host_id = req.host_id.clone();
+    let Some(agent) = st.agent(&host_id).await else {
+        return err(StatusCode::BAD_REQUEST, "host is offline");
+    };
+    let hostname = st
+        .db
+        .list_hosts()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|h| h.id == host_id)
+        .map(|h| h.hostname)
+        .unwrap_or_else(|| host_id.clone());
+
+    let cols = req.cols.unwrap_or(80).max(1);
+    let rows = req.rows.unwrap_or(24).max(1);
+    let pty_id = gen_id("p", 10);
+    let session = Arc::new(crate::state::PtySession::new(
+        pty_id.clone(),
+        host_id.clone(),
+        hostname.clone(),
+        cols,
+        rows,
+    ));
+    st.ptys.write().await.insert(pty_id.clone(), session.clone());
+    if !agent.send(HubMsg::PtyOpen {
+        id: pty_id.clone(),
+        term: Some("xterm-256color".into()),
+        cols,
+        rows,
+    }) {
+        st.ptys.write().await.remove(&pty_id);
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "agent send failed");
+    }
+    st.db.audit("pty.open", &host_id, &pty_id);
+    Ok(Json(PtySession {
+        pty_id,
+        host_id,
+        hostname,
+        cols,
+        rows,
+        attached: false,
+    }))
+}
+
 pub async fn pty(
     State(st): State<Arc<AppState>>,
     Query(q): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let host_id = q.get("host_id").cloned().unwrap_or_default();
     let cols: u16 = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(80);
     let rows: u16 = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(24);
+
+    if let Some(pty_id) = q.get("pty_id").filter(|s| !s.is_empty()).cloned() {
+        return ws.on_upgrade(move |socket| async move {
+            crate::pty::attach(st, socket, pty_id).await;
+        });
+    }
+
+    // Legacy one-shot: create and attach in a single upgrade.
+    let host_id = q.get("host_id").cloned().unwrap_or_default();
+    if host_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiError { error: "pty_id or host_id required".into() }))
+            .into_response();
+    }
     ws.on_upgrade(move |socket| async move {
-        crate::pty::relay(st, socket, host_id, cols, rows).await;
+        crate::pty::open_and_attach(st, socket, host_id, cols, rows).await;
     })
 }
 

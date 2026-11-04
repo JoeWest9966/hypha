@@ -103,7 +103,17 @@ hypha add --reusable -n homelab            # a 30-day reusable key
 hypha keys                                 # list saved keys
 hypha keys --revoke e_xxx                 # kill a leaked key
 hypha history
+hypha cancel x_abc123                       # kill a running command
+hypha audit                                 # who did what, newest first
+hypha audit --action exec --host web01
+hypha cp ./nginx.conf /etc/nginx/nginx.conf # atomic file push
+hypha push root@10.0.0.5 -t prod            # install over your own ssh
 ```
+
+`hypha push` is the one-click story that keeps the hub out of the credential
+business: it mints a one-shot token, builds an install command, and runs it
+through *your* ssh. Your keys never leave your machine, so the hub cannot become
+a vault that unlocks every box you own.
 
 ## How it works
 
@@ -112,8 +122,11 @@ hypha history
 | **agent → hub** | one WebSocket, JSON frames, agent initiated |
 | **auth** | enrol token → agent generates ed25519 keypair → hub challenges with a nonce on every connect |
 | **exec** | hub sends `exec{id,command}`, agent runs `$SHELL -lc` in its own session, streams 8 KiB chunks with a monotonic `seq`, then an exit frame |
-| **pty** | raw pty on the agent (`portable-pty`), base64 frames relayed by the hub |
-| **streaming** | cli/panel read an SSE feed backed by a per-exec replay buffer — reconnect and you get everything you missed |
+| **pty** | raw pty on the agent (`portable-pty`), base64 frames relayed by the hub. A session outlives its WebSocket: the hub keeps a 256 KiB scrollback and reattaches with replay, so a reload lands you back in the same shell (`pty_ttl_sec`, default 600) |
+| **streaming** | cli/panel read an SSE feed backed by a per-exec replay buffer — reconnect and you get everything you missed. Finished runs are also written to SQLite, so history survives a hub restart |
+| **files** | base64 in JSON, written by the agent as temp file + fsync + rename: a failed push never leaves a half-written file |
+| **metrics** | the agent samples /proc and statvfs every 30s and sends cpu/mem/disk/procs/uptime with its heartbeat |
+| **install URLs** | commands are minted from the origin the caller actually used, falling back to `public_url` — hit the hub over a tailnet IP or a MagicDNS name and the command matches. Loopback origins fall back, because `127.0.0.1` means nothing to the machine you are installing on |
 | **host death** | hub fails every in-flight job for that host immediately; nothing hangs |
 
 The agent never listens on a port and never talks to anything except the hub.
@@ -127,7 +140,13 @@ The agent never listens on a port and never talks to anything except the hub.
   another — we don't do that).
 - **There is no panel/CLI auth.** The network is the boundary. Agent auth is
   still real (ed25519), so a random host cannot join your fleet.
-- `audit` table records enrollments and every command. Tail it.
+- The hub deliberately cannot read ssh passwords or private keys, even when they
+  sit in another system's inventory. Installing a satellite is done from *your*
+  machine (`hypha push`), not from the hub.
+- Every state change lands in the `audit` table (enroll, tags, delete, token
+  revoke, exec, cancel, file push, shell open) and is readable at
+  `GET /api/audit` or `hypha audit`. It is the only answer to "who ran what on
+  which box last week".
 - **Keep an out-of-band way in** (ssh, cloud console). A tool that becomes your
   only door and then breaks is worse than ssh.
 
@@ -177,17 +196,22 @@ fork `mycelium` and want the single-binary story back, point `static_dir` at its
 
 ```sh
 scripts/check-api-contract.sh # router ↔ api/openapi.yaml, fails on drift
-scripts/smoke.sh              # hub + local satellite: enroll, exec, exit codes, pty, audit
+scripts/smoke.sh              # hub + local satellite: enroll, exec, exit codes, pty,
+                              # file push, metrics, cancel, shell reattach, audit,
+                              # and exec output surviving a hub restart
 ```
 
 The panel's own tests live in the mycelium repository.
 
 ## Status
 
-Early. Working today: enroll, fleet list, fan-out exec with live output, browser
-and CLI shells, tags, audit, host removal. Not there yet: file transfer, session
-reattach by id after a browser close, metrics, scheduled jobs, Windows/macOS
-agents.
+Working today: enroll, fleet list, fan-out exec with live output and durable
+history, cancellable runs, browser and CLI shells with reattach, tags, audit
+trail, host removal, atomic file push, host metrics, install-over-ssh from your
+own machine.
+
+Not there yet: scheduled jobs, broadcast to a tag with per-host arguments, log
+shipping, Windows/macOS agents.
 
 ## Layout
 

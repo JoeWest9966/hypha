@@ -8,8 +8,9 @@ use hypha_proto::{now, EnrollTokenInfo, Host};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct Db {
-    conn: std::sync::Mutex<Connection>,
+    conn: std::sync::Arc<std::sync::Mutex<Connection>>,
 }
 
 fn parse_tags(s: &str) -> Vec<String> {
@@ -38,7 +39,7 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let db = Self {
-            conn: std::sync::Mutex::new(conn),
+            conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
         };
         db.migrate()?;
         Ok(db)
@@ -88,6 +89,14 @@ impl Db {
                 detail TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts DESC);
+            -- Exec output, so a finished run is still readable after the hub
+            -- restarts. One row per SSE frame, verbatim: replay is byte-exact.
+            CREATE TABLE IF NOT EXISTS exec_chunks (
+                exec_id TEXT NOT NULL,
+                seq     INTEGER NOT NULL,
+                line    TEXT NOT NULL,
+                PRIMARY KEY (exec_id, seq)
+            );
             "#,
         )?;
         // Older databases predate reusable tokens. SQLite's ALTER TABLE is
@@ -187,6 +196,7 @@ impl Db {
                 last_seen: r.get(7)?,
                 online: false,
                 load: 0.0,
+                metrics: None,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -305,6 +315,71 @@ impl Db {
                 params![now(), action, host, detail],
             )
             .ok();
+    }
+
+    /// Append one SSE frame. `seq` is per-exec and monotonic, so the primary
+    /// key makes duplicate writes idempotent.
+    pub fn append_chunk(&self, exec_id: &str, seq: u64, line: &str) {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO exec_chunks (exec_id, seq, line) VALUES (?1, ?2, ?3)",
+                params![exec_id, seq as i64, line],
+            )
+            .ok();
+    }
+
+    /// Replay a finished exec, oldest frame first.
+    pub fn load_chunks(&self, exec_id: &str) -> Vec<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn
+            .prepare("SELECT line FROM exec_chunks WHERE exec_id = ?1 ORDER BY seq ASC")
+        {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(params![exec_id], |r| r.get::<_, String>(0));
+        match rows {
+            Ok(r) => r.filter_map(|x| x.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    pub fn list_audit(&self, limit: i64, action: &str, host: &str) -> Vec<serde_json::Value> {
+        let conn = self.conn.lock().unwrap();
+        // Every named parameter must appear in the statement even when unused:
+        // rusqlite rejects a bind list with names the SQL does not mention, so
+        // the empty case is folded into the predicate instead of the SQL text.
+        let sql = "SELECT id, ts, actor, action, host, detail FROM audit
+                   WHERE (:action = '' OR action = :action)
+                     AND (:host = '' OR host = :host)
+                   ORDER BY ts DESC, id DESC LIMIT :limit";
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(
+            rusqlite::named_params! {
+                ":action": action,
+                ":host": host,
+                ":limit": limit,
+            },
+            |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "ts": r.get::<_, i64>(1)?,
+                    "actor": r.get::<_, String>(2)?,
+                    "action": r.get::<_, String>(3)?,
+                    "host": r.get::<_, String>(4)?,
+                    "detail": r.get::<_, String>(5)?,
+                }))
+            },
+        );
+        match rows {
+            Ok(r) => r.filter_map(|x| x.ok()).collect(),
+            Err(_) => vec![],
+        }
     }
 
     pub fn record_exec(&self, id: &str, command: &str, hosts: &str) {
