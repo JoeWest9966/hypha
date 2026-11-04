@@ -97,7 +97,14 @@ async fn main() -> Result<()> {
         .route("/api/hosts", get(api::list_hosts))
         .route("/api/hosts/{id}", delete(api::delete_host))
         .route("/api/hosts/{id}/tags", post(api::set_tags))
-        .route("/api/enroll-tokens", post(api::create_enroll_token))
+        .route(
+            "/api/enroll-tokens",
+            get(api::list_enroll_tokens).post(api::create_enroll_token),
+        )
+        .route(
+            "/api/enroll-tokens/{token}",
+            delete(api::revoke_enroll_token),
+        )
         .route("/api/exec", post(api::create_exec))
         .route("/api/exec/{id}/events", get(api::exec_events))
         .route("/api/execs", get(api::recent_execs))

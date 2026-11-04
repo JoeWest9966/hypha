@@ -29,12 +29,23 @@ enum Cmd {
     Use { hub_url: Option<String> },
     /// List hosts.
     Hosts,
-    /// Create a one-time enroll token and print the install command.
+    /// Print an install command (one-shot by default).
     Add {
         #[arg(long, default_value = "24h")]
         ttl: String,
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// Reusable for 30 days; use as many times as you like.
+        #[arg(long)]
+        reusable: bool,
+        /// Name for a reusable key.
+        #[arg(short = 'n', long)]
+        name: Option<String>,
+    },
+    /// List / revoke saved install keys.
+    Keys {
+        #[arg(long)]
+        revoke: Option<String>,
     },
     /// Run a command on hosts. `--` separates the command.
     Run(Box<RunArgs>),
@@ -190,7 +201,8 @@ async fn main() -> Result<()> {
     match cmd {
         Cmd::Use { .. } => unreachable!(),
         Cmd::Hosts => hosts(&args, &cfg, &paint).await,
-        Cmd::Add { ttl, tags } => add(&args, &cfg, &paint, ttl, tags).await,
+        Cmd::Add { ttl, tags, reusable, name } => add(&args, &cfg, &paint, ttl, tags, reusable, name).await,
+        Cmd::Keys { revoke } => keys(&args, &cfg, &paint, revoke).await,
         Cmd::Run(run) => run_cmd(&args, &cfg, &paint, *run).await,
         Cmd::Sh { host } => shell(&args, &cfg, &paint, host).await,
         Cmd::Rm { host } => rm(&args, &cfg, &paint, host).await,
@@ -271,12 +283,24 @@ async fn hosts(args: &Args, cfg: &Config, paint: &Paint) -> Result<()> {
     Ok(())
 }
 
-async fn add(args: &Args, cfg: &Config, paint: &Paint, ttl: String, tags: Vec<String>) -> Result<()> {
+async fn add(
+    args: &Args,
+    cfg: &Config,
+    paint: &Paint,
+    ttl: String,
+    tags: Vec<String>,
+    reusable: bool,
+    name: Option<String>,
+) -> Result<()> {
     let hub = hub_url(args, cfg);
-    let secs = parse_duration(&ttl)?;
+    let secs = if reusable { parse_duration("30d")? } else { parse_duration(&ttl)? };
+    let mut body = json!({ "ttl_sec": secs, "tags": tags, "reusable": reusable });
+    if let Some(n) = name {
+        body["label"] = json!(n);
+    }
     let resp = client_with(cfg)
         .post(format!("{hub}/api/enroll-tokens"))
-        .json(&json!({ "ttl_sec": secs, "tags": tags }))
+        .json(&body)
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -287,13 +311,55 @@ async fn add(args: &Args, cfg: &Config, paint: &Paint, ttl: String, tags: Vec<St
     println!();
     println!("  {}", paint.cyan(&out.install_cmd));
     println!();
+    if reusable {
+        println!("{}", paint.yellow("  keep this safe: it enrolls unlimited hosts until it expires or is revoked"));
+        println!();
+    }
     println!(
         "{}",
         paint.dim(&format!(
-            "token expires {} (one use)",
-            chrono_like(out.expires_at)
+            "{} · expires {} · {}",
+            out.label,
+            chrono_like(out.expires_at),
+            if reusable { "reusable" } else { "single use" }
         ))
     );
+    Ok(())
+}
+
+async fn keys(args: &Args, cfg: &Config, paint: &Paint, revoke: Option<String>) -> Result<()> {
+    let hub = hub_url(args, cfg);
+    if let Some(token) = revoke {
+        let resp = client_with(cfg)
+            .delete(format!("{hub}/api/enroll-tokens/{token}"))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            bail!("{}", resp.text().await.unwrap_or_default());
+        }
+        println!("{} revoked {}", paint.green("ok"), token);
+        return Ok(());
+    }
+    let resp = client_with(cfg)
+        .get(format!("{hub}/api/enroll-tokens"))
+        .send()
+        .await?;
+    let list: Vec<EnrollTokenInfo> = resp.json().await?;
+    let keys: Vec<EnrollTokenInfo> = list.into_iter().filter(|t| t.reusable).collect();
+    if keys.is_empty() {
+        println!("{}", paint.dim("no reusable keys — `hypha add --reusable -n <name>`"));
+        return Ok(());
+    }
+    for k in keys {
+        let state = if k.revoked {
+            paint.red("REVOKED")
+        } else if k.expires_at < hypha_proto::now() {
+            paint.dim("expired")
+        } else {
+            paint.green("active")
+        };
+        println!("{} {:<20} {} uses  {}  {}", state, k.label, k.uses, k.token, paint.dim(&k.install_cmd));
+    }
     Ok(())
 }
 

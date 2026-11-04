@@ -71,23 +71,52 @@
   </main>
 </div>
 
+
 <!-- ───────────────────────── add host modal ───────────────────────── -->
 <div class="modal-backdrop" id="add-modal" hidden>
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="add-modal-title">
+  <div class="modal modal-lg" role="dialog" aria-modal="true" aria-labelledby="add-modal-title">
     <div class="modal-head">
-      <h2 id="add-modal-title">Add a host</h2>
+      <h2 id="add-modal-title">Install command</h2>
       <button class="btn btn-ghost btn-sm" data-close="add-modal" aria-label="Close">Close</button>
     </div>
     <div class="modal-body">
-      <p class="modal-text">
-        Run this on the server as root. The agent enrolls itself, installs as a
-        service, and opens a single outbound connection back to this hub.
+
+      <div class="seg" role="tablist" aria-label="Token type">
+        <button class="seg-btn active" id="tab-once" role="tab" aria-selected="true"
+                type="button">One-shot</button>
+        <button class="seg-btn" id="tab-reusable" role="tab" aria-selected="false"
+                type="button">Reusable · 30 days</button>
+      </div>
+
+      <p class="modal-text" id="token-help">
+        Runs once, expires in 24 hours. Use this for a single new machine.
       </p>
+
       <pre class="install-cmd" id="install-cmd">generating…</pre>
       <p class="dim" id="install-expiry"></p>
+
+      <div class="key-warn" id="key-warn" hidden>
+        This command enrolls unlimited machines. Treat it as a key: keep it out
+        of chat logs, screenshots and shared docs. Revoke it here if it leaks.
+      </div>
+
+      <div class="key-list-wrap" id="key-list-wrap">
+        <div class="key-list-head">
+          <span>Saved reusable keys</span>
+          <button class="btn btn-ghost btn-sm" id="refresh-keys-btn" type="button">Refresh</button>
+        </div>
+        <div class="key-list" id="key-list">
+          <p class="dim">No reusable keys yet.</p>
+        </div>
+      </div>
+
     </div>
     <div class="modal-foot">
-      <button class="btn btn-ghost" id="regenerate-btn">Regenerate</button>
+      <label class="key-label" id="label-wrap" hidden>
+        <span>Name</span>
+        <input type="text" id="key-label-input" maxlength="64" placeholder="e.g. homelab" autocomplete="off">
+      </label>
+      <button class="btn btn-ghost" id="regenerate-btn">Generate new</button>
       <button class="btn btn-primary" id="copy-install-btn">Copy command</button>
     </div>
   </div>

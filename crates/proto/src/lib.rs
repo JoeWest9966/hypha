@@ -201,12 +201,35 @@ pub struct Host {
 pub struct EnrollTokenRequest {
     pub ttl_sec: Option<i64>,
     pub tags: Option<Vec<String>>,
+    /// Reusable tokens are not burned on use. Keep them somewhere safe: they
+    /// are a permanent-ish key to enrolling hosts in this fleet.
+    #[serde(default)]
+    pub reusable: bool,
+    /// Human-readable label so you can tell your keys apart later.
+    #[serde(default)]
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollTokenResponse {
     pub token: String,
     pub expires_at: i64,
+    pub install_cmd: String,
+    pub reusable: bool,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrollTokenInfo {
+    pub token: String,
+    pub label: String,
+    pub tags: Vec<String>,
+    pub reusable: bool,
+    pub revoked: bool,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub uses: i64,
+    pub last_used_at: Option<i64>,
     pub install_cmd: String,
 }
 

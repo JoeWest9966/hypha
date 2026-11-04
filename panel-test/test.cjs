@@ -37,9 +37,22 @@ function makeFetch(log) {
     if (u.endsWith('/api/hosts')) payload = HOSTS;
     else if (u.endsWith('/api/exec')) {
       payload = { exec_id: 'x_1', jobs: [{ host_id: 'h_1', hostname: 'web01', job_id: 'j_1' }] };
-    } else if (u.includes('/api/enroll-tokens')) {
+    } else if (u.endsWith('/api/enroll-tokens') && method === 'POST') {
       payload = { token: 'e_1', expires_at: Math.floor(Date.now() / 1000) + 3600,
-                  install_cmd: 'curl -fsSL http://hub/install.sh?token=e_1 | sudo sh' };
+                  install_cmd: 'curl -fsSL http://hub/install.sh?token=e_1 | sudo sh',
+                  reusable: !!(body && body.reusable), label: 'homelab' };
+    } else if (u.endsWith('/api/enroll-tokens') && method === 'GET') {
+      payload = [
+        { token: 'e_1', label: 'homelab', tags: ['lab'], reusable: true, revoked: false,
+          created_at: 1, expires_at: Math.floor(Date.now() / 1000) + 2592000,
+          uses: 3, last_used_at: 1,
+          install_cmd: 'curl -fsSL http://hub/install.sh?token=e_1 | sudo sh' },
+        { token: 'e_2', label: 'old', tags: [], reusable: false, revoked: false,
+          created_at: 1, expires_at: 2, uses: 1, last_used_at: 1,
+          install_cmd: 'curl -fsSL http://hub/install.sh?token=e_2 | sudo sh' }
+      ];
+    } else if (u.includes('/api/enroll-tokens/') && method === 'DELETE') {
+      payload = { ok: true };
     } else if (method === 'DELETE') payload = { ok: true };
     else payload = {};
     return Promise.resolve({
@@ -150,11 +163,36 @@ class FakeWebSocket {
     return true;
   })());
 
-  console.log('\nadd host');
+  console.log('\ninstall commands');
   d.getElementById('add-host-btn').dispatchEvent(new w.Event('click', { bubbles: true }));
   await sleep(100);
   const cmdText = d.body.textContent;
-  check('install command shown', cmdText.includes('install.sh?token='), cmdText.slice(0, 200));
+  check('one-shot command shown', cmdText.includes('install.sh?token='), cmdText.slice(0, 200));
+  check('one-shot is default tab', d.getElementById('tab-once').classList.contains('active'));
+  check('key list hidden for one-shot', d.getElementById('key-list-wrap').hidden);
+  check('warning hidden for one-shot', d.getElementById('key-warn').hidden);
+
+  d.getElementById('tab-reusable').dispatchEvent(new w.Event('click', { bubbles: true }));
+  await sleep(120);
+  check('reusable tab active', d.getElementById('tab-reusable').classList.contains('active'));
+  check('key list visible', !d.getElementById('key-list-wrap').hidden);
+  check('warning visible', !d.getElementById('key-warn').hidden);
+  check('name field visible', !d.getElementById('label-wrap').hidden);
+  const rows = d.querySelectorAll('.key-row');
+  check('reusable keys listed (one-shots excluded)', rows.length === 1, String(rows.length));
+  check('key row shows uses + label', rows.length && rows[0].textContent.includes('homelab') &&
+        rows[0].textContent.includes('3 uses'), rows.length ? rows[0].textContent : '');
+  check('revoke button present', !!d.querySelector('.key-row button[aria-label^="revoke"]'));
+  const revokeBtn = d.querySelector('.key-row button[aria-label^="revoke"]');
+  if (revokeBtn) {
+    revokeBtn.dispatchEvent(new w.Event('click', { bubbles: true }));
+    await sleep(80);
+    check('revoke calls DELETE', apiLog.some(l => l.startsWith('DELETE /api/enroll-tokens/e_1')),
+          JSON.stringify(apiLog.filter(l => l.startsWith('DELETE'))));
+  }
+  d.getElementById('tab-once').dispatchEvent(new w.Event('click', { bubbles: true }));
+  await sleep(80);
+  check('switching back hides list', d.getElementById('key-list-wrap').hidden);
 
   console.log('\nshell');
   const shellBtn = d.querySelector('.host-row .btn-shell, .host-row [data-act="shell"], .host-row button');

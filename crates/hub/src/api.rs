@@ -137,22 +137,76 @@ pub async fn set_tags(
     Ok(Json(json!({ "ok": true })))
 }
 
+fn install_command(base: &str, token: &str) -> String {
+    format!("curl -fsSL {base}/install.sh?token={token} | sudo sh")
+}
+
 pub async fn create_enroll_token(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<EnrollTokenRequest>,
 ) -> Api<EnrollTokenResponse> {
-    let ttl = req.ttl_sec.unwrap_or(86400).clamp(60, 60 * 60 * 24 * 30);
+    // Reusable keys live 30 days; one-shot keys live 24h. Explicit ttl wins,
+    // but never more than 30 days -- a leaked key should have a shelf life.
+    let default_ttl = if req.reusable { 30 * 86400 } else { 86400 };
+    let ttl = req
+        .ttl_sec
+        .unwrap_or(default_ttl)
+        .clamp(60, 30 * 86400);
     let token = gen_id("e", 24);
     let tags = req.tags.unwrap_or_default();
-    st.db.create_enroll_token(&token, &tags, ttl);
+    let label = if req.label.trim().is_empty() {
+        if req.reusable {
+            "reusable key".to_string()
+        } else {
+            "one-shot".to_string()
+        }
+    } else {
+        req.label.trim().chars().take(64).collect()
+    };
+    let expires_at = now() + ttl;
+    st.db
+        .create_enroll_token(&token, &tags, &label, req.reusable, ttl);
     let base = public_base(&st, &headers);
-    st.db.audit("enroll.token", "", &tags.join(","));
+    st.db.audit(
+        if req.reusable {
+            "enroll.token.reusable"
+        } else {
+            "enroll.token"
+        },
+        "",
+        &format!("{label} [{}]", tags.join(",")),
+    );
     Ok(Json(EnrollTokenResponse {
         token: token.clone(),
-        expires_at: now() + ttl,
-        install_cmd: format!("curl -fsSL {base}/install.sh?token={token} | sudo sh"),
+        expires_at,
+        install_cmd: install_command(&base, &token),
+        reusable: req.reusable,
+        label,
     }))
+}
+
+pub async fn list_enroll_tokens(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Api<Vec<EnrollTokenInfo>> {
+    let base = public_base(&st, &headers);
+    let mut list = st.db.list_enroll_tokens();
+    for t in list.iter_mut() {
+        t.install_cmd = install_command(&base, &t.token);
+    }
+    Ok(Json(list))
+}
+
+pub async fn revoke_enroll_token(
+    State(st): State<Arc<AppState>>,
+    Path(token): Path<String>,
+) -> Api<serde_json::Value> {
+    if !st.db.revoke_enroll_token(&token) {
+        return err(StatusCode::NOT_FOUND, "unknown token");
+    }
+    st.db.audit("enroll.token.revoke", "", &token);
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ---------------------------------------------------------------------------

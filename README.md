@@ -74,8 +74,25 @@ Panel → **＋ Add host** → copy the command → run it on the target as root
 curl -fsSL https://hub.example.com/install.sh?token=e_xxx | sudo sh
 ```
 
-It downloads `hypha-sat`, enrolls (single-use token, 24h), installs a systemd
-unit, starts it. The host appears in the panel in about a second.
+It downloads `hypha-sat`, enrolls, installs a systemd unit, starts it. The host
+appears in the panel in about a second.
+
+Two kinds of install command:
+
+| | One-shot (default) | Reusable |
+|---|---|---|
+| lifetime | 24h | 30 days |
+| uses | 1 | unlimited, counted |
+| listed in panel | no | yes, with **Copy** / **Revoke** |
+| for | one new machine | a command you keep in your notes |
+
+Pick **Reusable · 30 days** in the Add host dialog, name it, and it stays in the
+panel so you can come back and copy it next week. Revoke it if it leaks. From
+the CLI: `hypha add --reusable -n homelab`, `hypha keys`,
+`hypha keys --revoke <token>`.
+
+A reusable install command is a key to your fleet. Don't paste it into chat,
+screenshots, or dotfiles in a public repo.
 
 ### 4. use it
 
@@ -86,7 +103,10 @@ hypha run -- 'uptime'                       # every host
 hypha run web01 db01 -- 'systemctl status nginx'
 hypha run -t prod -- 'df -h /'
 hypha sh web01                              # full tty, detach with Ctrl-]
-hypha add --tag staging                     # another enroll command
+hypha add --tag staging                     # another one-shot command
+hypha add --reusable -n homelab            # a 30-day reusable key
+hypha keys                                 # list saved keys
+hypha keys --revoke e_xxx                 # kill a leaked key
 hypha history
 ```
 

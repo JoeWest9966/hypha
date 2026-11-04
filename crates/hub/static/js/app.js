@@ -366,11 +366,32 @@
     liveStreams[execId] = es;
   }
 
-  // ── add host modal ───────────────────────────────────────────────────
+  // ── install commands ────────────────────────────────────────────────
+  // Two kinds of key: one-shot (burned on first use, 24h) and reusable
+  // (30 days, countable uses, revocable). The reusable ones are listed here
+  // so "come back next week and copy it again" actually works.
+  var keyMode = 'once';
+
+  function setKeyMode(mode) {
+    keyMode = mode;
+    var reusable = mode === 'reusable';
+    $('tab-once').classList.toggle('active', !reusable);
+    $('tab-reusable').classList.toggle('active', reusable);
+    $('tab-once').setAttribute('aria-selected', String(!reusable));
+    $('tab-reusable').setAttribute('aria-selected', String(reusable));
+    $('token-help').textContent = reusable
+      ? 'Runs on as many machines as you like for 30 days. Save it somewhere safe.'
+      : 'Runs once, expires in 24 hours. Use this for a single new machine.';
+    $('key-warn').hidden = !reusable;
+    $('label-wrap').hidden = !reusable;
+    $('key-list-wrap').hidden = !reusable;
+    $('regenerate-btn').textContent = reusable ? 'Create another key' : 'Generate new';
+    if (reusable) loadKeys();
+  }
+
   function openAddModal() {
     $('add-modal').hidden = false;
-    $('install-cmd').textContent = 'generating…';
-    $('install-expiry').textContent = '';
+    setKeyMode('once');
     generateToken();
     setTimeout(function () { $('copy-install-btn').focus(); }, 0);
   }
@@ -378,20 +399,93 @@
   function closeModal(id) { $(id).hidden = true; }
 
   function generateToken() {
-    api('/api/enroll-tokens', {
-      method: 'POST',
-      body: { ttl_sec: 86400 }
-    }).then(function (r) {
+    var reusable = keyMode === 'reusable';
+    $('install-cmd').textContent = 'generating…';
+    $('install-expiry').textContent = '';
+    var body = reusable
+      ? { reusable: true, label: $('key-label-input').value.trim() }
+      : { ttl_sec: 86400 };
+    api('/api/enroll-tokens', { method: 'POST', body: body }).then(function (r) {
       $('install-cmd').textContent = r.install_cmd;
       var d = new Date(r.expires_at * 1000);
-      $('install-expiry').textContent = 'expires ' + d.toLocaleString();
+      $('install-expiry').textContent = r.label + ' · expires ' + d.toLocaleString();
+      if (reusable) { $('key-label-input').value = ''; loadKeys(); }
     }).catch(function (e) {
       $('install-cmd').textContent = 'error: ' + e.message;
     });
   }
 
-  function copyInstall() {
-    var text = $('install-cmd').textContent;
+  function loadKeys() {
+    api('/api/enroll-tokens').then(function (list) {
+      var box = $('key-list');
+      box.textContent = '';
+      var reusable = list.filter(function (t) { return t.reusable; });
+      if (!reusable.length) {
+        var p = document.createElement('p');
+        p.className = 'dim';
+        p.textContent = 'No reusable keys yet.';
+        box.appendChild(p);
+        return;
+      }
+      reusable.forEach(function (t) { box.appendChild(keyRow(t)); });
+    }).catch(function (e) { toast('keys: ' + e.message); });
+  }
+
+  function keyRow(t) {
+    var row = document.createElement('div');
+    row.className = 'key-row' + (t.revoked || t.expires_at * 1000 < Date.now() ? ' dead' : '');
+
+    var info = document.createElement('div');
+    info.className = 'key-info';
+    var name = document.createElement('div');
+    name.className = 'key-name';
+    name.textContent = t.label || 'unnamed';
+    var meta = document.createElement('div');
+    meta.className = 'dim';
+    var state = t.revoked ? 'revoked' :
+      (t.expires_at * 1000 < Date.now() ? 'expired' :
+        'expires ' + new Date(t.expires_at * 1000).toLocaleDateString());
+    meta.textContent = t.uses + ' uses · ' + state +
+      (t.tags.length ? ' · [' + t.tags.join(', ') + ']' : '');
+    info.appendChild(name);
+    info.appendChild(meta);
+
+    var actions = document.createElement('div');
+    actions.className = 'key-actions';
+
+    var copy = document.createElement('button');
+    copy.className = 'btn btn-ghost btn-sm';
+    copy.type = 'button';
+    copy.textContent = 'Copy';
+    copy.setAttribute('aria-label', 'copy install command for ' + (t.label || 'unnamed key'));
+    copy.disabled = t.revoked || t.expires_at * 1000 < Date.now();
+    copy.addEventListener('click', function () {
+      copyText(t.install_cmd);
+      // also show it in the big box so it is visible, not just on the clipboard
+      $('install-cmd').textContent = t.install_cmd;
+      $('install-expiry').textContent = t.label + ' · ' + t.uses + ' uses';
+    });
+
+    var revoke = document.createElement('button');
+    revoke.className = 'btn btn-ghost btn-sm btn-danger-ghost';
+    revoke.type = 'button';
+    revoke.textContent = 'Revoke';
+    revoke.setAttribute('aria-label', 'revoke ' + (t.label || 'unnamed key'));
+    revoke.disabled = t.revoked;
+    revoke.addEventListener('click', function () {
+      api('/api/enroll-tokens/' + encodeURIComponent(t.token), { method: 'DELETE' })
+        .then(function () { toast('key revoked', 'ok'); loadKeys(); })
+        .catch(function (e) { toast('revoke failed: ' + e.message); });
+    });
+
+    actions.appendChild(copy);
+    actions.appendChild(revoke);
+    row.appendChild(info);
+    row.appendChild(actions);
+    return row;
+  }
+
+  function copyText(text) {
     var done = function () { toast('copied to clipboard', 'ok'); };
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text, done); });
@@ -399,6 +493,8 @@
       fallbackCopy(text, done);
     }
   }
+
+  function copyInstall() { copyText($('install-cmd').textContent); }
 
   function fallbackCopy(text, done) {
     var ta = document.createElement('textarea');
@@ -567,6 +663,9 @@
   $('add-host-btn').addEventListener('click', openAddModal);
   $('regenerate-btn').addEventListener('click', generateToken);
   $('copy-install-btn').addEventListener('click', copyInstall);
+  $('tab-once').addEventListener('click', function () { setKeyMode('once'); generateToken(); });
+  $('tab-reusable').addEventListener('click', function () { setKeyMode('reusable'); generateToken(); });
+  $('refresh-keys-btn').addEventListener('click', loadKeys);
   $('del-confirm-btn').addEventListener('click', doDelete);
   $('term-close-btn').addEventListener('click', closeTerminal);
 

@@ -4,7 +4,7 @@
 //! abstraction nobody will read.
 
 use anyhow::{Context, Result};
-use hypha_proto::{now, Host};
+use hypha_proto::{now, EnrollTokenInfo, Host};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
@@ -63,6 +63,10 @@ impl Db {
             CREATE TABLE IF NOT EXISTS enroll_tokens (
                 token      TEXT PRIMARY KEY,
                 tags       TEXT NOT NULL DEFAULT '',
+                label      TEXT NOT NULL DEFAULT '',
+                reusable   INTEGER NOT NULL DEFAULT 0,
+                revoked    INTEGER NOT NULL DEFAULT 0,
+                uses       INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 used_at    INTEGER,
@@ -86,6 +90,16 @@ impl Db {
             CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts DESC);
             "#,
         )?;
+        // Older databases predate reusable tokens. SQLite's ALTER TABLE is
+        // cheap here; ignore "duplicate column" if we've already migrated.
+        for (col, decl) in [
+            ("label", "TEXT NOT NULL DEFAULT ''"),
+            ("reusable", "INTEGER NOT NULL DEFAULT 0"),
+            ("revoked", "INTEGER NOT NULL DEFAULT 0"),
+            ("uses", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            conn.execute(&format!("ALTER TABLE enroll_tokens ADD COLUMN {col} {decl}"), []).ok();
+        }
         Ok(())
     }
 
@@ -180,41 +194,104 @@ impl Db {
 
     // --- enroll tokens ----------------------------------------------------
 
-    pub fn create_enroll_token(&self, token: &str, tags: &[String], ttl: i64) {
+    pub fn create_enroll_token(
+        &self,
+        token: &str,
+        tags: &[String],
+        label: &str,
+        reusable: bool,
+        ttl: i64,
+    ) {
         let ts = now();
         self.conn
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO enroll_tokens (token, tags, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![token, join_tags(tags), ts, ts + ttl],
+                "INSERT INTO enroll_tokens
+                 (token, tags, label, reusable, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![token, join_tags(tags), label, reusable as i32, ts, ts + ttl],
             )
             .ok();
     }
 
-    /// Validate + burn a token atomically. Returns its tags on success.
+    /// Validate a token. Single-use tokens are burned atomically; reusable ones
+    /// are counted instead. Returns the tags to apply to the new host.
     pub fn consume_enroll_token(&self, token: &str, used_by: &str) -> Option<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let row: Option<(String, i64, Option<i64>)> = conn
+        let row: Option<(String, i64, Option<i64>, i64, i64)> = conn
             .query_row(
-                "SELECT tags, expires_at, used_at FROM enroll_tokens WHERE token = ?1",
+                "SELECT tags, expires_at, used_at, reusable, revoked
+                 FROM enroll_tokens WHERE token = ?1",
                 params![token],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()
             .ok()
             .flatten();
-        let (tags, expires_at, used_at) = row?;
-        if used_at.is_some() || expires_at < now() {
+        let (tags, expires_at, used_at, reusable, revoked) = row?;
+        if revoked != 0 || expires_at < now() {
             return None;
         }
-        conn.execute(
-            "UPDATE enroll_tokens SET used_at = ?2, used_by = ?3 WHERE token = ?1",
-            params![token, now(), used_by],
-        )
-        .ok()?;
+        if reusable == 0 {
+            if used_at.is_some() {
+                return None;
+            }
+            conn.execute(
+                "UPDATE enroll_tokens SET used_at = ?2, used_by = ?3, uses = 1 WHERE token = ?1",
+                params![token, now(), used_by],
+            )
+            .ok()?;
+        } else {
+            conn.execute(
+                "UPDATE enroll_tokens SET uses = uses + 1, used_at = ?2, used_by = ?3 WHERE token = ?1",
+                params![token, now(), used_by],
+            )
+            .ok()?;
+        }
         Some(parse_tags(&tags))
+    }
+
+    pub fn list_enroll_tokens(&self) -> Vec<EnrollTokenInfo> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT token, tags, label, reusable, revoked, created_at,
+                    expires_at, uses, used_at
+             FROM enroll_tokens ORDER BY created_at DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok(EnrollTokenInfo {
+                token: r.get(0)?,
+                tags: parse_tags(&r.get::<_, String>(1)?),
+                label: r.get(2)?,
+                reusable: r.get::<_, i64>(3)? != 0,
+                revoked: r.get::<_, i64>(4)? != 0,
+                created_at: r.get(5)?,
+                expires_at: r.get(6)?,
+                uses: r.get(7)?,
+                last_used_at: r.get(8)?,
+                install_cmd: String::new(),
+            })
+        });
+        match rows {
+            Ok(r) => r.filter_map(|x| x.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    pub fn revoke_enroll_token(&self, token: &str) -> bool {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE enroll_tokens SET revoked = 1 WHERE token = ?1",
+                params![token],
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false)
     }
 
     // --- audit ------------------------------------------------------------
