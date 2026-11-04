@@ -1,0 +1,14 @@
+# hypha hub behind Caddy. Point DNS at the box, run `caddy run`, done.
+# Certificates are automatic. SSE and WebSocket both pass through untouched,
+# but responses must not be buffered.
+hub.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:5522 {
+		flush_interval -1
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+}

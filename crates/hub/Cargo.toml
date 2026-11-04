@@ -1,0 +1,32 @@
+[package]
+name = "hypha-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hyphad"
+path = "src/main.rs"
+
+[dependencies]
+hypha-proto = { path = "../proto" }
+anyhow = { workspace = true }
+argon2 = "0.5"
+axum = { version = "0.8", features = ["ws", "macros"] }
+async-stream = "0.3"
+base64 = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

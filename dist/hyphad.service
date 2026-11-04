@@ -1,0 +1,22 @@
+[Unit]
+Description=hypha hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hypha
+Group=hypha
+WorkingDirectory=/var/lib/hypha
+ExecStart=/usr/local/bin/hyphad --config /etc/hypha/hub.json
+Restart=always
+RestartSec=2
+StateDirectory=hypha
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/hypha
+
+[Install]
+WantedBy=multi-user.target
