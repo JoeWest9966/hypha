@@ -1,0 +1,5 @@
+# Static musl builds are the only thing we ship: a binary that requires a newer
+# glibc than the target has is not a binary, it is a support ticket.
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]

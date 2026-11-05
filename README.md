@@ -192,10 +192,31 @@ those are how a satellite gets onto a machine, not part of the panel. See
 fork `mycelium` and want the single-binary story back, point `static_dir` at its
 `dist/` — the hub will serve it from anywhere.
 
+## Release builds are static, and that is not negotiable
+
+`cargo build --release` on any modern distribution produces a binary that needs
+that distribution's glibc. Ship it and the first older machine answers with
+`weak version 'GLIBC_2.39' not found` — and then keeps running, which is worse
+than crashing, because it looks like it worked. It happened once; that machine
+enrolled, wrote a systemd unit and went offline on the next restart.
+
+So: `scripts/build.sh` targets `-unknown-linux-musl` with `musl-gcc` (`.cargo/config.toml`
+sets the linker), `scripts/check-binaries.sh` greps every file under `bin/` for
+`GLIBC_` symbols and runs `--version` on it, and `dist/install.sh` refuses to
+install a binary that will not execute — before it burns the one-shot token and
+writes a service that cannot start.
+
+Upgrading a satellite *through* the agent needs care: the agent runs in
+`hypha-sat.service`'s cgroup, so `systemctl stop` kills your upgrade script too,
+`setsid` included. Either run the upgrade from outside (ssh, or `hypha push`), or
+escape the cgroup with
+`systemd-run --unit=hypha-upgrade --collect sh -c '...'`.
+
 ## Tests
 
 ```sh
 scripts/check-api-contract.sh # router ↔ api/openapi.yaml, fails on drift
+scripts/check-binaries.sh     # every shipped binary is static and runs
 scripts/smoke.sh              # hub + local satellite: enroll, exec, exit codes, pty,
                               # file push, metrics, cancel, shell reattach, audit,
                               # and exec output surviving a hub restart

@@ -37,3 +37,6 @@ esac
 # Also stage plain names so `install.sh` works on the build host.
 cp "bin/hypha-sat-linux-$(uname -m)" bin/hypha-sat 2>/dev/null || true
 ls -lh bin/
+
+# Nothing leaves this directory unless it is static and actually runs.
+./scripts/check-binaries.sh

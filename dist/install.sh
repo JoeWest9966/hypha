@@ -44,7 +44,21 @@ else
     die "need curl or wget"
 fi
 
-install -D -m 0755 "$TMP/hypha-sat" "${PREFIX}/hypha-sat"
+# Check the downloaded binary before it touches anything. This installer once
+# wrote a service for a hypha-sat that could not start ("GLIBC_2.39 not found"),
+# because it trusted the bytes it had just fetched. It also burned the one-shot
+# token doing it.
+if ! "$TMP/hypha-sat" --version >/dev/null 2>&1; then
+    die "$(printf '%s' "$TMP/hypha-sat --version" | sed 's|.*/hypha-sat|hypha-sat|') will not run on this machine:
+$( "$TMP/hypha-sat" --version 2>&1 | head -3 )
+Nothing was installed. Report this with 'uname -a' and 'ldd --version'."
+fi
+
+install -D -m 0755 "$TMP/hypha-sat" "${PREFIX}/.hypha-sat.new"
+# Rename, don't overwrite: replacing a running binary in place fails with
+# "Text file busy", which is exactly the state this script runs in during an
+# upgrade.
+mv -f "${PREFIX}/.hypha-sat.new" "${PREFIX}/hypha-sat"
 mkdir -p "$CONF_DIR"
 
 say "enrolling with token ${TOKEN}"
