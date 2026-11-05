@@ -63,14 +63,23 @@ if you have no web server.
 
 ### 3. add a server
 
-Panel → **＋ Add host** → copy the command → run it on the target as root:
+Click **Install** in the panel's top bar — the command is already on your
+clipboard — then run it on the target. It looks like this:
 
 ```sh
-curl -fsSL https://hub.example.com/install.sh?token=e_xxx | sudo sh
+if s=$(curl -fsSL --connect-timeout 8 --max-time 60 'https://hub.example.com/install.sh?token=e_xxx'); then
+  printf '%s' "$s" | { if [ "$(id -u)" = 0 ]; then sh; else sudo sh; fi; }
+else echo 'hypha: could not download the installer' >&2; false; fi
 ```
 
 It downloads `hypha-sat`, enrolls, installs a systemd unit, starts it. The host
 appears in the panel in about a second.
+
+Two details that are not accidents. It does not pipe `curl` into `sh`: the pipe's
+exit status is `sh`'s, so an unreachable hub would print "installed" on a machine
+where nothing happened. And the script is held in a variable rather than a temp
+file: the download contains a live enroll token, and a file that survives Ctrl-C
+is a file that survives in `/tmp` until the next reboot.
 
 Two kinds of install command:
 
