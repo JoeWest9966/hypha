@@ -196,12 +196,21 @@ fn install_command(base: &str, token: &str) -> String {
     // reach the hub, sh gets an empty stdin, exits 0, and the install looks
     // successful on a machine where nothing happened — which is exactly how a
     // 130-second hang got reported as "installed, but the host never showed up".
-    // Download to a file first so the download's exit status survives, and put a
-    // connect timeout on it so an unreachable hub fails in seconds, not minutes.
+    //
+    // So fetch first, then feed the script to sh on stdin: the download's exit
+    // status survives, and nothing is written to disk. The previous version
+    // downloaded to `mktemp` and deleted it afterwards, which left a file in /tmp
+    // containing a live enroll token whenever the run was interrupted (Ctrl-C, a
+    // dropped ssh session), and its closing `exit $rc` took the caller's shell
+    // down with it — pasted into an ssh session, that is a logout.
+    //
+    // `--max-time` matters as much as `--connect-timeout`: a hub that accepts the
+    // connection and then stalls would otherwise hang until the operator hits
+    // Ctrl-C, which is the case that used to leak the token.
     format!(
-        "t=$(mktemp) && curl -fsSL --connect-timeout 10 {base}/install.sh?token={token} -o \"$t\" \
-         && if [ \"$(id -u)\" = 0 ]; then sh \"$t\"; else sudo sh \"$t\"; fi; \
-         rc=$?; rm -f \"$t\"; exit $rc"
+        "if s=$(curl -fsSL --connect-timeout 8 --max-time 60 '{base}/install.sh?token={token}'); then \
+           printf '%s' \"$s\" | {{ if [ \"$(id -u)\" = 0 ]; then sh; else sudo sh; fi; }}; \
+         else echo 'hypha: could not download the installer from {base} -- the hub is unreachable' >&2; false; fi"
     )
 }
 

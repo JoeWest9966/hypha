@@ -4,6 +4,11 @@
 #
 #   curl -fsSL <hub>/install.sh?token=xxx | sudo sh
 #
+# The command the panel hands out does not pipe, though — it fetches the script
+# into a variable first, so a failed download cannot look like a successful
+# install, and feeds it to sh on stdin so nothing lands on disk (this file
+# contains a live token).
+#
 set -eu
 
 HUB="__HUB__"
