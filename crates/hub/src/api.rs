@@ -105,6 +105,16 @@ pub async fn enroll(State(st): State<Arc<AppState>>, Json(req): Json<EnrollReque
         load: 0.0,
         metrics: None,
     };
+    // A reinstall mints a new identity. If we kept the old row, every
+    // "Reinstall" in the panel would add a host that is offline forever. So the
+    // newest claim on a hostname retires the older ones: hostnames are how a
+    // human names a machine, and two machines wearing the same name is a config
+    // error where the newer one wins.
+    for stale in st.db.hosts_by_hostname(&req.hostname) {
+        retire_host(&st, &stale).await;
+        st.db.audit("host.replace", &stale, &req.hostname);
+        tracing::info!(host = %req.hostname, old = %stale, "host replaced by re-enrollment");
+    }
     if let Err(e) = st.db.insert_host(&host, &req.pubkey) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db: {e}"));
     }
@@ -138,11 +148,18 @@ pub async fn delete_host(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Api<serde_json::Value> {
-    if let Some(a) = st.agent(&id).await {
+    retire_host(&st, &id).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Everything that has to die with a host record: the row, the live connection,
+/// and any shell attached to it. Shells are the part people forget — they keep
+/// an agent process alive forever with nobody able to reach it.
+async fn retire_host(st: &Arc<AppState>, id: &str) {
+    let _ = st.db.delete_host(id);
+    if let Some(a) = st.agent(id).await {
         a.send(HubMsg::Shutdown);
     }
-    // Shells on a host that no longer exists would keep an agent process alive
-    // forever with nobody able to reach it.
     let doomed: Vec<Arc<crate::state::PtySession>> = st
         .ptys
         .read()
@@ -157,8 +174,6 @@ pub async fn delete_host(
         }
         st.ptys.write().await.remove(&p.id);
     }
-    st.db.delete_host(&id).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: e.to_string() })))?;
-    Ok(Json(json!({ "ok": true })))
 }
 
 pub async fn set_tags(
@@ -177,7 +192,17 @@ pub async fn set_tags(
 }
 
 fn install_command(base: &str, token: &str) -> String {
-    format!("curl -fsSL {base}/install.sh?token={token} | sudo sh")
+    // `curl ... | sudo sh` reports the *pipeline's* last status. When curl cannot
+    // reach the hub, sh gets an empty stdin, exits 0, and the install looks
+    // successful on a machine where nothing happened — which is exactly how a
+    // 130-second hang got reported as "installed, but the host never showed up".
+    // Download to a file first so the download's exit status survives, and put a
+    // connect timeout on it so an unreachable hub fails in seconds, not minutes.
+    format!(
+        "t=$(mktemp) && curl -fsSL --connect-timeout 10 {base}/install.sh?token={token} -o \"$t\" \
+         && if [ \"$(id -u)\" = 0 ]; then sh \"$t\"; else sudo sh \"$t\"; fi; \
+         rc=$?; rm -f \"$t\"; exit $rc"
+    )
 }
 
 pub async fn create_enroll_token(
