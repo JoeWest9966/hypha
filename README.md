@@ -115,6 +115,23 @@ business: it mints a one-shot token, builds an install command, and runs it
 through *your* ssh. Your keys never leave your machine, so the hub cannot become
 a vault that unlocks every box you own.
 
+Two things about that command are deliberate:
+
+- it downloads the installer to a file and then runs it, instead of
+  `curl ... | sudo sh`. A pipeline reports the *last* command's status, so an
+  unreachable hub means `sh` reads an empty stdin, exits 0, and the install looks
+  successful on a machine where nothing happened. Piping is how a 130-second hang
+  got reported as "installed, but the host never showed up".
+- it carries `--connect-timeout 10`, so "the target cannot reach the hub" is a
+  ten-second answer rather than a two-minute one.
+
+**Reinstalling mints a new identity, and the hub retires the old record.** The
+newest enrollment claiming a hostname wins (`host.replace` in the audit trail).
+Without that, every reinstall leaves a ghost host that is offline forever. The
+consequence to know about: two agents claiming the same hostname cannot coexist,
+so test satellites should pass `enroll --name smoke-$$` — which is exactly what
+`scripts/smoke.sh` does.
+
 ## How it works
 
 | | |
@@ -219,7 +236,10 @@ scripts/check-api-contract.sh # router ↔ api/openapi.yaml, fails on drift
 scripts/check-binaries.sh     # every shipped binary is static and runs
 scripts/smoke.sh              # hub + local satellite: enroll, exec, exit codes, pty,
                               # file push, metrics, cancel, shell reattach, audit,
-                              # and exec output surviving a hub restart
+                              # and exec output surviving a hub restart. Enrolls
+                              # under a throwaway name so it cannot retire a real
+                              # host on the same box (pass --name in enroll for the
+                              # same reason in your own tests)
 ```
 
 The panel's own tests live in the mycelium repository.

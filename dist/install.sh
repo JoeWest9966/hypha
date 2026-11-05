@@ -44,12 +44,16 @@ else
     die "need curl or wget"
 fi
 
+# curl writes 0644. Without this, the check below reports "Permission denied"
+# and every install dies before it starts.
+chmod 0755 "$TMP/hypha-sat"
+
 # Check the downloaded binary before it touches anything. This installer once
 # wrote a service for a hypha-sat that could not start ("GLIBC_2.39 not found"),
 # because it trusted the bytes it had just fetched. It also burned the one-shot
 # token doing it.
 if ! "$TMP/hypha-sat" --version >/dev/null 2>&1; then
-    die "$(printf '%s' "$TMP/hypha-sat --version" | sed 's|.*/hypha-sat|hypha-sat|') will not run on this machine:
+    die "the downloaded hypha-sat will not run on this machine:
 $( "$TMP/hypha-sat" --version 2>&1 | head -3 )
 Nothing was installed. Report this with 'uname -a' and 'ldd --version'."
 fi
@@ -86,7 +90,12 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now "$SVC_NAME"
+    # enable, then restart — not "enable --now". On a reinstall the agent is
+    # already running with the config we just replaced, so --now leaves it alive
+    # on the old identity and the machine shows up twice: once online, once
+    # silent. restart also starts the unit when it was stopped.
+    systemctl enable "$SVC_NAME"
+    systemctl restart "$SVC_NAME"
     sleep 1
     systemctl is-active --quiet "$SVC_NAME" || die "service failed to start: journalctl -u $SVC_NAME"
 else

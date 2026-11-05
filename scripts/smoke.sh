@@ -56,7 +56,11 @@ ENROLL="$(curl -sf -X POST "$HUB/api/enroll-tokens" -H 'content-type: applicatio
     -d '{"ttl_sec":600,"tags":["smoke"]}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')"
 
 say "enrolling local satellite"
-"$BIN/hypha-sat" --config "$TMP/agent.json" enroll --hub "$HUB" --token "$ENROLL" > /dev/null
+# The hub retires a host record when a new enrollment claims the same hostname, so
+# a smoke run on a box that also runs a real agent would delete the real one.
+# Claim a throwaway name instead.
+"$BIN/hypha-sat" --config "$TMP/agent.json" enroll --hub "$HUB" --token "$ENROLL" \
+    --name "smoke-$$" > /dev/null
 "$BIN/hypha-sat" --config "$TMP/agent.json" run > "$TMP/agent.log" 2>&1 &
 SAT_PID=$!
 

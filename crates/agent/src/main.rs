@@ -46,6 +46,11 @@ enum Cmd {
         /// Optional comma separated tags; the enroll token's tags win if set.
         #[arg(long)]
         tags: Option<String>,
+        /// Report a different name than this machine's hostname. Test satellites
+        /// need it: the hub keys re-enrollment by hostname, so a smoke run on the
+        /// same box as a production agent would otherwise retire the real host.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Run in the foreground (systemd does this for you).
     Run,
@@ -151,6 +156,7 @@ async fn main() -> Result<()> {
             token,
             insecure,
             tags,
+            name,
         } => {
             use rand_core::OsRng;
             let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
@@ -158,7 +164,7 @@ async fn main() -> Result<()> {
             let body = EnrollRequest {
                 token,
                 pubkey: pubkey.clone(),
-                hostname: hostname(),
+                hostname: name.unwrap_or_else(hostname),
                 os: std::env::consts::OS.into(),
                 arch: std::env::consts::ARCH.into(),
                 version: env!("CARGO_PKG_VERSION").into(),

@@ -132,6 +132,18 @@ impl Db {
         Ok(())
     }
 
+    /// Every host currently claiming this hostname, newest first.
+    pub fn hosts_by_hostname(&self, hostname: &str) -> Vec<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare("SELECT id FROM hosts WHERE hostname = ?1") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![hostname], |r| r.get::<_, String>(0))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
     pub fn pubkey_of(&self, id: &str) -> Option<String> {
         self.conn
             .lock()
